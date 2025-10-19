@@ -332,6 +332,8 @@ export default function ClassicChatbotUI() {
   const [hideProfileBanner, setHideProfileBanner] = useState<boolean>(() => {
     try { return sessionStorage.getItem('hideProfileBanner') === '1'; } catch { return false; }
   });
+  const [triageById, setTriageById] = useState<Record<string, { level: string; reasons?: string[] }>>({});
+  const [urgentAckById, setUrgentAckById] = useState<Record<string, boolean>>({});
   const structured = activeId ? structuredById[activeId] ?? null : null;
   const explanation = activeId ? explanationById[activeId] ?? "" : "";
   // Precompute sanitized explanation at top-level so hooks order remains stable
@@ -447,6 +449,9 @@ export default function ClassicChatbotUI() {
           setMissingFieldsById((m) => ({ ...m, [activeId]: chatResponse.missing_fields as any }));
           setHideProfileBanner((prev) => prev || (chatResponse.missing_fields || []).length === 0);
         }
+        if (chatResponse.triage) {
+          setTriageById((t) => ({ ...t, [activeId]: chatResponse.triage as any }));
+        }
       }
       const assistantText = chatResponse.ai_explanation || chatResponse.summary || "";
       const safe = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
@@ -517,6 +522,7 @@ export default function ClassicChatbotUI() {
           if (Array.isArray(resp.missing_fields)) {
             setMissingFieldsById((m) => ({ ...m, [activeId]: resp.missing_fields as any }));
           }
+          if (resp.triage) setTriageById((t) => ({ ...t, [activeId]: resp.triage as any }));
         }
         const assistantText = resp.ai_explanation || resp.summary || "";
         const safeText = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
@@ -668,6 +674,36 @@ export default function ClassicChatbotUI() {
             <div className="font-semibold tracking-tight">{active?.title || "Chat"}</div>
           </div>
 
+          {triageById[activeId || '']?.level === 'urgent' && !urgentAckById[activeId || ''] && (
+            <div className="mx-4 mt-3 rounded-xl border border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-900/20 dark:text-red-200 p-3 flex items-start gap-3">
+              <ShieldAlert className="w-5 h-5" />
+              <div className="flex-1 text-sm">
+                <div className="font-semibold mb-0.5">Seek care now</div>
+                <div className="text-[13px] opacity-90">{(triageById[activeId || '']?.reasons || []).length ? `Red flags detected: ${(triageById[activeId || '']?.reasons || []).join(', ')}` : 'Red flags detected.'}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="text-xs px-2 py-1 rounded-lg border border-red-300 dark:border-red-700 hover:bg-red-100 dark:hover:bg-red-900/30 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-400"
+                  onClick={() => setUrgentAckById((u) => ({ ...u, [activeId || '']: true }))}
+                  aria-label="Acknowledge urgent triage"
+                >
+                  Okay, understood
+                </button>
+              </div>
+            </div>
+          )}
+          {triageById[activeId || '']?.level === 'urgent' && urgentAckById[activeId || ''] && (
+            <div className="mx-4 mt-3">
+              <span
+                className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200"
+                role="status"
+                aria-label="Urgent triage detected"
+                title={(triageById[activeId || '']?.reasons || []).join(', ')}
+              >
+                <ShieldAlert className="w-3 h-3" /> Urgent triage
+              </span>
+            </div>
+          )}
           {!hideProfileBanner && Array.isArray(missingFieldsById[activeId || '']) && (missingFieldsById[activeId || '']?.length || 0) > 0 && (
             <div className="mx-4 mt-3 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200 p-3 flex items-center gap-3">
               <ShieldAlert className="w-5 h-5" />
@@ -677,20 +713,23 @@ export default function ClassicChatbotUI() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-400"
                   onClick={() => setProfileOpen(true)}
+                  aria-label="Open profile settings"
                 >
                   Open Profile
                 </button>
                 <button
-                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-400"
                   onClick={() => uploadInputRef.current?.click()}
+                  aria-label="Upload latest lab report"
                 >
                   Upload Lab
                 </button>
                 <button
-                  className="text-xs px-2 py-1 rounded-lg text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  className="text-xs px-2 py-1 rounded-lg text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-400"
                   onClick={() => { try { sessionStorage.setItem('hideProfileBanner','1'); } catch {}; setHideProfileBanner(true); }}
+                  aria-label="Hide profile completion banner"
                 >
                   Don’t show again
                 </button>
@@ -712,8 +751,9 @@ export default function ClassicChatbotUI() {
                 <div className="flex items-end gap-2">
                   {/* + (Upload) */}
                   <label
-                    className={`shrink-0 inline-flex items-center justify-center rounded-xl p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${fileBusy ? 'animate-pulse' : ''}`}
+                    className={`shrink-0 inline-flex items-center justify-center rounded-xl p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${fileBusy ? 'animate-pulse' : ''} focus-within:outline-none focus-within:ring-2 focus-within:ring-offset-2 focus-within:ring-zinc-400`}
                     title="Upload (PDF/Image/Text)"
+                    aria-label="Upload file"
                   >
                     <input
                       type="file"
@@ -739,7 +779,7 @@ export default function ClassicChatbotUI() {
                   {/* Send */}
                   <button
                     onClick={handleSend}
-                    className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90 disabled:opacity-40"
+                    className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-400"
                     disabled={!input.trim() || busy || fileBusy}
                     aria-label="Send"
                   >
@@ -748,9 +788,10 @@ export default function ClassicChatbotUI() {
                   {/* Analyze Symptoms Button */}
                   <button
                     onClick={handleAnalyzeSymptoms}
-                    className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-40"
+                    className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-400"
                     disabled={!input.trim() || busy || fileBusy}
                     title="Analyze for Symptoms"
+                    aria-label="Analyze for symptoms"
                   >
                     {busy ? <><Loader2 className="w-4 h-4 animate-spin" /> Working...</> : <><Send className="w-4 h-4" /> Send</>}
                   </button>
@@ -825,13 +866,14 @@ export default function ClassicChatbotUI() {
                   <span className="text-[10px] text-zinc-400">source: {explanationSourceById[activeId || ''] || 'unknown'}</span>
                 )}
                 <button
-                  className="text-[11px] px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1"
+                  className="text-[11px] px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-400"
                   onClick={() => {
                     try {
                       navigator.clipboard.writeText(explanation || "");
                     } catch {}
                   }}
                   title="Copy AI explanation"
+                  aria-label="Copy AI explanation"
                 >
                   <Copy className="w-3 h-3" /> Copy
                 </button>
@@ -894,8 +936,31 @@ function ChatMessage({ msg }: { msg: Message }) {
         {/* Render structured extras for assistant messages */}
         {!isUser && msg.localRecommendations && (
           <div className="mt-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-3">
-            <div className="text-xs uppercase tracking-wide text-zinc-500 mb-1">Recommendations</div>
-            <div className="text-[13px] mb-2">Priority: {msg.localRecommendations.priority || 'low'}</div>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-xs uppercase tracking-wide text-zinc-500">Recommendations</div>
+              <button
+                className="text-[11px] px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-400"
+                onClick={() => {
+                  try {
+                    const lines = [
+                      `Priority: ${msg.localRecommendations?.priority || 'low'}`,
+                      ...(msg.localRecommendations?.actions || []).map((a) => `- ${a}`),
+                      msg.localRecommendations?.follow_up ? `Follow-up: ${msg.localRecommendations.follow_up}` : '',
+                    ].filter(Boolean);
+                    navigator.clipboard.writeText(lines.join('\n'));
+                  } catch {}
+                }}
+                title="Copy recommendations"
+                aria-label="Copy recommendations"
+              >
+                <Copy className="w-3 h-3" /> Copy
+              </button>
+            </div>
+            <div className="text-[13px] mb-2">Priority: {msg.localRecommendations.priority || 'low'}
+              {msg.localRecommendations.priority?.toLowerCase() === 'high' && (
+                <span className="ml-2 inline-flex items-center px-2 py-0.5 text-[10px] rounded-full border border-red-300 text-red-700 bg-red-50 dark:border-red-700 dark:text-red-200 dark:bg-red-900/30">High</span>
+              )}
+            </div>
             {/* DEV/Info: show event_id and confidence from symptom_analysis to ensure we read them */}
             {(msg.symptomAnalysis?.event_id || typeof msg.symptomAnalysis?.confidence === 'number') && (
               <div className="text-[11px] text-zinc-500 mb-2">
