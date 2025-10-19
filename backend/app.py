@@ -5,7 +5,7 @@ import sys
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, APIRouter, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, constr
@@ -704,7 +704,7 @@ NER_FALLBACK_MODEL_NAME = "placeholder_fallback_model"
 
 
 @app.post("/api/parse_lab")
-def parse_lab(req: ParseRequest):
+def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
         text = req.text if isinstance(req.text, str) else (req.text or "")
         text = str(text)
@@ -712,6 +712,41 @@ def parse_lab(req: ParseRequest):
             raise ValueError("Empty text")
 
         data = parse_lab_text(text)
+
+        # Persist structured lab for current user
+        try:
+            tests = data.get("tests") or []
+            analyte_names = [t.get("name") for t in tests if t.get("name")][:3]
+            abnormal_count = sum(1 for t in tests if (t.get("abnormal") or t.get("status")) in ("high", "low"))
+            title_suffix = ", ".join([n for n in analyte_names if n]) or "Lab Report"
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            title = f"{title_suffix} — {ts}"
+            summary = f"Parsed {len(tests)} analytes; {abnormal_count} abnormal."
+            lr = LabReport(
+                user_id=str(user.id),
+                title=title,
+                raw_text=text,
+                structured_json=data,
+                summary=summary,
+            )
+            db.add(lr)
+            db.commit()
+            try:
+                logger.info({
+                    "function": "lab_saved",
+                    "request_id": getattr(request, "request_id", None),
+                    "analyte_count": len(tests),
+                    "abnormal_count": abnormal_count,
+                    "lab_id": str(lr.id),
+                })
+            except Exception:
+                pass
+            data["lab_id"] = str(lr.id)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return data
 
     except Exception as e:
@@ -813,6 +848,51 @@ async def chat(
     except Exception:
         pass
 
+    # Fetch latest structured lab early (prefer cache if present; fallback to DB)
+    latest_lab_struct_early: Optional[Dict[str, Any]] = None
+    lab_source = "none"
+    try:
+        # If you later add an app-level cache, consult it here
+        cached = None
+        if cached and isinstance(cached, dict):
+            latest_lab_struct_early = cached
+            lab_source = "cache"
+        else:
+            lab = (
+                db.query(LabReport)
+                .filter(LabReport.user_id == str(user.id))
+                .order_by(LabReport.created_at.desc())
+                .first()
+            )
+            latest_lab_struct_early = lab.structured_json if (lab and lab.structured_json) else None
+            lab_source = "db" if latest_lab_struct_early is not None else "none"
+    except Exception:
+        latest_lab_struct_early = None
+        lab_source = "none"
+    try:
+        analyte_names: list = []
+        abnormal_count = 0
+        if isinstance(latest_lab_struct_early, dict):
+            tests = latest_lab_struct_early.get("tests") or []
+            if isinstance(tests, list):
+                for t in tests:
+                    nm = (t or {}).get("name")
+                    if nm and nm not in analyte_names:
+                        analyte_names.append(nm)
+                    ab = (t or {}).get("abnormal") or (t or {}).get("status")
+                    if isinstance(ab, str) and ab.lower() in ("high", "low"):
+                        abnormal_count += 1
+        logger.info({
+            "function": "lab_context",
+            "request_id": request_id,
+            "source": lab_source,
+            "has_structured_lab": latest_lab_struct_early is not None,
+            "analyte_names": analyte_names,
+            "abnormal_count": abnormal_count,
+        })
+    except Exception:
+        pass
+
     # Run deterministic symptom parsing first
     try:
         pipeline_json = symp.summarize_to_json(payload.message).model_dump()
@@ -867,7 +947,8 @@ async def chat(
 
     # Build local recommendations block using profile + latest lab + reported symptoms
     local_recs: Dict[str, Any] = {}
-    latest_lab_struct = None
+    # Reuse the early-resolved latest lab, if any
+    latest_lab_struct = latest_lab_struct_early
     profile_dict = None
     try:
         prof = db.query(UserProfile).filter(UserProfile.user_id == str(user.id)).first()
@@ -882,41 +963,45 @@ async def chat(
             except Exception:
                 profile_dict = None
 
-        lab = (
-            db.query(LabReport)
-            .filter(LabReport.user_id == str(user.id))
-            .order_by(LabReport.created_at.desc())
-            .first()
-        )
-        latest_lab_struct = lab.structured_json if (lab and lab.structured_json) else None
-
         # Compute triage from red flags and labs
         rf = red_flag_triage(symptom_analysis.get("symptoms", []), payload.message)
-        lt = lab_triage(latest_lab_struct)
-        # Normalize triage to low/moderate/high scale
-        # If red flags urgent -> treat as 'high'
+        if latest_lab_struct is None:
+            lt = {"level": "low", "reasons": [], "suggested_window": "routine follow-up"}
+        else:
+            lt = lab_triage(latest_lab_struct)
+        # Normalize red-flag triage to low/moderate/high
         level_map = {"ok": "low", "watch": "moderate", "urgent": "high"}
-        rf_level = level_map.get(rf.get("level"), "low") if isinstance(rf, dict) else "low"
+        rf_level = level_map.get((rf or {}).get("level"), "low")
+        lab_level = (lt or {}).get("level", "low")
         # Choose the higher of lab and red-flag levels
         order = ["low", "moderate", "high"]
         def max_level(a: str, b: str) -> str:
             return a if order.index(a) >= order.index(b) else b
-        triage_level = max_level(lt.get("level", "low"), rf_level)
-        triage_reasons = []
-        if isinstance(lt, dict):
-            triage_reasons += lt.get("reasons", []) or []
-        if isinstance(rf, dict) and rf.get("reasons"):
-            triage_reasons += [f"red flag: {r}" for r in rf.get("reasons")]
-        triage_window = lt.get("suggested_window") if triage_level != "low" else "routine follow-up"
+        triage_level = max_level(lab_level, rf_level)
+        # Merge reasons and de-duplicate while preserving order
+        triage_reasons_raw = []
+        triage_reasons_raw += (lt.get("reasons", []) if isinstance(lt, dict) else [])
+        triage_reasons_raw += ([f"red flag: {r}" for r in (rf.get("reasons") or [])] if isinstance(rf, dict) else [])
+        seen_r: set = set()
+        triage_reasons: list = []
+        for r in triage_reasons_raw:
+            if not r:
+                continue
+            if r not in seen_r:
+                seen_r.add(r)
+                triage_reasons.append(r)
+        # Suggested window by final level (moderate: routine follow-up; high: as soon as practical)
+        triage_window = "as soon as practical" if triage_level == "high" else "routine follow-up"
         triage = {"level": triage_level, "reasons": triage_reasons, "suggested_window": triage_window}
 
         # Build recommendations and then sync priority with triage
         local_recs = recommend(profile_dict, latest_lab_struct, symptom_analysis.get("symptoms", []), raw_text=payload.message)
         try:
-            # Map triage level to priority
-            tri_to_pri = {"high": "high", "moderate": "moderate", "low": "low"}
-            mapped = tri_to_pri.get(triage_level, local_recs.get("priority", "low"))
-            local_recs["priority"] = mapped
+            # Map triage level to at least the same priority; do not downgrade if symptom rules already raised it
+            order = {"low": 0, "moderate": 1, "high": 2}
+            current = (local_recs.get("priority") or "low").lower()
+            if order.get(triage_level, 0) > order.get(current, 0):
+                local_recs["priority"] = triage_level
             if triage_level == "high":
                 # Ensure urgent prompts present
                 urgent_action = "Seek medical attention promptly"
@@ -942,12 +1027,14 @@ async def chat(
             })
         except Exception:
             pass
-        # compact triage log
+        # Single triage log per request with both sources and final
         try:
             logger.info({
                 "function": "triage",
                 "request_id": request_id,
-                "level": triage.get("level"),
+                "symptom_level": rf_level,
+                "lab_level": lab_level,
+                "final_level": triage_level,
                 "reason_count": len(triage.get("reasons", [])),
             })
         except Exception:
@@ -1110,7 +1197,7 @@ async def chat(
 
 @router.post("/explain", response_model=ExplainOut)
 @limiter.limit("2/minute")
-async def explain(request: Request, payload: ExplainIn) -> ExplainOut:
+async def explain(request: Request, payload: ExplainIn, db: Session = Depends(get_db), user: User = Depends(get_current_user), response: Response = None) -> ExplainOut:
     structured = payload.structured
 
     # fallback if no key
@@ -1125,6 +1212,41 @@ async def explain(request: Request, payload: ExplainIn) -> ExplainOut:
         txt = ("Here's a brief summary of your labs.\n\n" +
                "\n".join(lines) +
                "\n\nThis is educational only; please consult a clinician.")
+        # Persist a LabReport with structured and summary
+        try:
+            tests = structured.get("tests") or []
+            abnormal_count = sum(1 for t in tests if (t.get("abnormal") or t.get("status")) in ("high","low"))
+            names = [t.get("name") for t in tests if t.get("name")][:3]
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            title = f"{', '.join([n for n in names if n]) or 'Lab Report'} — {ts}"
+            lr = LabReport(
+                user_id=str(user.id),
+                title=title,
+                raw_text=json.dumps(structured, ensure_ascii=False),
+                structured_json=structured,
+                summary=txt,
+            )
+            db.add(lr)
+            db.commit()
+            if response is not None:
+                try:
+                    response.headers["X-Lab-Id"] = str(lr.id)
+                except Exception:
+                    pass
+            try:
+                logger.info({
+                    "function": "lab_saved",
+                    "analyte_count": len(tests),
+                    "abnormal_count": abnormal_count,
+                    "lab_id": str(lr.id),
+                })
+            except Exception:
+                pass
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return ExplainOut(explanation=txt)
 
     # call Gemini
@@ -1152,7 +1274,43 @@ async def explain(request: Request, payload: ExplainIn) -> ExplainOut:
                     .get("parts", [{}])[0]
                     .get("text", "")
             ) or "I couldn’t generate a response."
-            return ExplainOut(explanation=text.strip())
+            try:
+                final = text.strip()
+                # Persist LabReport for structured
+                tests = structured.get("tests") or []
+                abnormal_count = sum(1 for t in tests if (t.get("abnormal") or t.get("status")) in ("high","low"))
+                names = [t.get("name") for t in tests if t.get("name")][:3]
+                ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+                title = f"{', '.join([n for n in names if n]) or 'Lab Report'} — {ts}"
+                lr = LabReport(
+                    user_id=str(user.id),
+                    title=title,
+                    raw_text=json.dumps(structured, ensure_ascii=False),
+                    structured_json=structured,
+                    summary=final,
+                )
+                db.add(lr)
+                db.commit()
+                if response is not None:
+                    try:
+                        response.headers["X-Lab-Id"] = str(lr.id)
+                    except Exception:
+                        pass
+                try:
+                    logger.info({
+                        "function": "lab_saved",
+                        "analyte_count": len(tests),
+                        "abnormal_count": abnormal_count,
+                        "lab_id": str(lr.id),
+                    })
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            return ExplainOut(explanation=final)
     except Exception as e:
         logger.exception("explain failed")
         return ExplainOut(explanation=f"⚠️ Gemini error: {e}")

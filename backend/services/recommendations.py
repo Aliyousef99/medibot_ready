@@ -167,12 +167,21 @@ def lab_triage(structured_lab: Optional[dict]) -> Dict:
                 reasons.append("Ferritin markedly elevated vs ref 10–120 ng/mL")
 
             # Any abnormal value elevates to at least moderate
-            if abnormal in ("high", "low") and level == "low":
-                level = "moderate"
+            if abnormal in ("high", "low"):
+                if level == "low":
+                    level = "moderate"
+                # Add a brief reason for each abnormal analyte
+                pretty_name = (t.get("name") or name).strip() or name
+                if abnormal == "high":
+                    reason = f"{pretty_name} above reference"
+                else:
+                    reason = f"{pretty_name} below reference"
+                if reason not in reasons:
+                    reasons.append(reason)
         except Exception:
             continue
 
-    suggested_window = "as soon as practical" if level in ("moderate", "high") else "routine follow-up"
+    suggested_window = "as soon as practical" if level == "high" else "routine follow-up"
     return {"level": level, "reasons": reasons, "suggested_window": suggested_window}
 
 
