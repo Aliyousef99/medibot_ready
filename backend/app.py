@@ -42,6 +42,7 @@ GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or "").strip()
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
 HUGGINGFACE_TOKEN = (os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACE_API_KEY") or "").strip()
 BIOBERT_MODEL_NAME = os.getenv("BIOBERT_MODEL_NAME", "d4data/biobert_ner").strip() or "d4data/biobert_ner"
+AI_EXPLANATION_ENABLED = (os.getenv("AI_EXPLANATION_ENABLED", "true") or "true").strip().lower() not in {"0","false","off","no"}
 
 app = FastAPI(title="MediBot Backend", version="0.1.0")
 router = APIRouter(prefix="/api")
@@ -170,6 +171,8 @@ class ChatOut(BaseModel):
     symptom_analysis: Dict[str, Any]
     local_recommendations: Dict[str, Any]
     ai_explanation: str
+    ai_explanation_source: Optional[str] = None  # "model" | "fallback" | "skipped"
+    timed_out: Optional[bool] = None
     disclaimer: str
     pipeline: Optional[Dict[str, Any]] = None
 
@@ -624,7 +627,10 @@ async def chat(
             db.rollback()
         except Exception:
             pass
-        logger.exception("save_symptom_event failed in /api/chat")
+        try:
+            logger.exception("save_symptom_event failed in /api/chat", extra={"request_id": request_id})
+        except Exception:
+            pass
     if ev_id:
         try:
             symptom_analysis["event_id"] = ev_id
@@ -694,19 +700,25 @@ async def chat(
         f"{', '.join(symptom_analysis.get('possible_tests') or []) or 'none'}\n"
     )
 
+    # Always attempt AI explanation unless explicitly disabled by config or missing key
     ai_explanation = ""
-    do_ai = True
-    if pipeline_json.get("overall_confidence", 0.0) >= 0.5:
-        do_ai = False
-        ai_explanation = "Structured symptom analysis provided; AI summary skipped."
-    if not GEMINI_API_KEY:
-        do_ai = False
-        ai_explanation = "Chat model not configured; showing local analysis only."
-
+    ai_explanation_source = "skipped"
     timed_out = False
-    if do_ai:
+
+    if not AI_EXPLANATION_ENABLED:
+        ai_explanation = "AI explanation disabled by config."
+        ai_explanation_source = "skipped"
+    elif not GEMINI_API_KEY:
+        ai_explanation = "AI explanation skipped: model not configured."
+        ai_explanation_source = "skipped"
+    else:
+        # Proceed to call the model with strict timeout
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            logger.info({"function": "ai_explanation", "request_id": request_id, "stage": "ai_start"})
+        except Exception:
+            pass
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
                 r = await client.post(
                     url,
@@ -723,29 +735,28 @@ async def chat(
                     .get("text", "")
                     or ""
                 ).strip()
+                ai_explanation_source = "model"
+                timed_out = False
         except httpx.TimeoutException:
             timed_out = True
-            ai_explanation = "AI explanation timed out. Please review the suggestions above."
-        except Exception as e:
-            ai_explanation = "AI explanation unavailable at the moment."
+            ai_explanation_source = "fallback"
+            ai_explanation = "AI explanation unavailable; showing structured recommendations."
+        except Exception:
+            timed_out = False
+            ai_explanation_source = "fallback"
+            ai_explanation = "AI explanation unavailable; showing structured recommendations."
         finally:
             try:
                 logger.info({
                     "function": "ai_explanation",
                     "request_id": request_id,
+                    "stage": "ai_done",
+                    "ai_explanation_source": ai_explanation_source,
                     "timed_out": timed_out,
+                    "chars": len(ai_explanation or ""),
                 })
             except Exception:
                 pass
-    else:
-        try:
-            logger.info({
-                "function": "ai_explanation",
-                "request_id": request_id,
-                "timed_out": False,
-            })
-        except Exception:
-            pass
 
     # Compose summary and disclaimer
     try:
@@ -756,8 +767,23 @@ async def chat(
         summary = ""
     disclaimer = "For educational purposes only. Consult a medical professional for medical advice."
 
+    # Ensure event_id key exists even when not persisted
+    symptom_analysis.setdefault("event_id", None)
+
+    # Final integrity log before return: keys present in payload
     try:
-        logger.info({"function": "end_chat", "request_id": request_id})
+        top_keys = [
+            "request_id",
+            "summary",
+            "symptom_analysis",
+            "local_recommendations",
+            "ai_explanation",
+            "ai_explanation_source",
+            "timed_out",
+            "disclaimer",
+            "pipeline",
+        ]
+        logger.info({"function": "end_chat", "request_id": request_id, "keys": top_keys})
     except Exception:
         pass
 
@@ -767,6 +793,8 @@ async def chat(
         symptom_analysis=symptom_analysis,
         local_recommendations=local_recs or {"priority": "low", "actions": ["Monitor symptoms and rest"], "follow_up": "If symptoms persist >48h, worsen, or include red flags (fainting, chest pain), seek medical care.", "rationale": "Initial self-care suggestions based on reported symptoms."},
         ai_explanation=ai_explanation,
+        ai_explanation_source=ai_explanation_source,
+        timed_out=timed_out,
         disclaimer=disclaimer,
         pipeline={"symptom_parse": pipeline_json},
     )
