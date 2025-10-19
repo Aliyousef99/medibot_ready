@@ -264,6 +264,7 @@ class ExplainIn(BaseModel):
 
 class ExplainOut(BaseModel):
     explanation: str
+    lab_report_id: Optional[str] = None
 
 # -------------------- Utils --------------------
 
@@ -779,12 +780,14 @@ def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db)
                 logger.info({
                     "function": "lab_persist",
                     "user_id": str(user.id),
+                    "lab_report_id": str(lr.id),
                     "analyte_count": len(tests),
                     "abnormal_count": abnormal_count,
                 })
             except Exception:
                 pass
-            data["lab_id"] = str(lr.id)
+            data["lab_id"] = str(lr.id)  # backward-compatible key
+            data["lab_report_id"] = str(lr.id)
         except Exception:
             try:
                 db.rollback()
@@ -866,9 +869,36 @@ async def list_models(request: Request):
             logger.error("list_models failed")
             raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
 
+# ---- Simple per-user chat history (in-memory) ----
+if not hasattr(app.state, "chat_history_store"):
+    app.state.chat_history_store = {}  # type: ignore[attr-defined]
+
+MAX_CHAT_HISTORY = 50  # keep last 50 turns (user/assistant messages)
+
+def append_chat_history(user_id: str, role: str, content: str) -> None:
+    try:
+        store = app.state.chat_history_store  # type: ignore[attr-defined]
+        bucket = store.setdefault(user_id, [])
+        bucket.append({"role": role, "content": content})
+        # trim oldest beyond limit
+        if len(bucket) > MAX_CHAT_HISTORY:
+            del bucket[: len(bucket) - MAX_CHAT_HISTORY]
+    except Exception:
+        pass
+
+def get_chat_history(user_id: str):
+    try:
+        store = app.state.chat_history_store  # type: ignore[attr-defined]
+        hist = store.get(user_id) or []
+        return hist if isinstance(hist, list) else []
+    except Exception:
+        return []
+
+
 @app.post("/api/chat", response_model=ChatOut)
-@limiter.limit("30/minute", key_func=user_rate_key)
-@limiter.limit("100/minute", key_func=get_remote_address)
+# Relax rate limits to support continuous chat sessions
+@limiter.limit("120/minute", key_func=user_rate_key)
+@limiter.limit("300/minute", key_func=get_remote_address)
 async def chat(
     request: Request,
     payload: ChatIn,
@@ -891,27 +921,96 @@ async def chat(
     except Exception:
         pass
 
-    # Fetch latest structured lab early (prefer cache if present; fallback to DB)
+    # Append the incoming user message to per-user chat history
+    try:
+        append_chat_history(str(user.id), "user", payload.message or "")
+    except Exception:
+        pass
+
+    # If the incoming message looks like a lab report, parse and persist now
+    try:
+        maybe_lab = parse_lab_text(payload.message or "")
+        tests_now = (maybe_lab or {}).get("tests") if isinstance(maybe_lab, dict) else None
+        if isinstance(tests_now, list) and len(tests_now) > 0:
+            # Persist LabReport and cache for this user; make it the current context
+            try:
+                abnormal_count_now = sum(1 for t in tests_now if ((t or {}).get("abnormal") or (t or {}).get("status")) in ("high","low"))
+                names_now = [t.get("name") for t in tests_now if (isinstance(t, dict) and t.get("name"))][:3]
+                ts_now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+                title_now = f"{', '.join([n for n in names_now if n]) or 'Lab Report'} — {ts_now}"
+                lr_now = LabReport(
+                    user_id=str(user.id),
+                    title=title_now,
+                    raw_text=payload.message or "",
+                    structured_json=maybe_lab,
+                    summary=f"Parsed {len(tests_now)} analytes; {abnormal_count_now} abnormal.",
+                )
+                db.add(lr_now)
+                db.commit()
+                set_latest_lab_cache(str(user.id), maybe_lab)
+                try:
+                    request.state.structured_lab = maybe_lab
+                except Exception:
+                    pass
+                try:
+                    logger.info({
+                        "function": "lab_persist",
+                        "user_id": str(user.id),
+                        "lab_report_id": str(lr_now.id),
+                        "analyte_count": len(tests_now),
+                        "abnormal_count": abnormal_count_now,
+                    })
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Resolve latest structured lab: current -> cache -> db -> none
     latest_lab_struct_early: Optional[Dict[str, Any]] = None
     lab_source = "none"
     try:
-        # Cache first
-        cached = get_latest_lab_cache(str(user.id))
-        if cached and isinstance(cached, dict):
-            latest_lab_struct_early = cached
-            lab_source = "cache"
+        # a) current (middleware may attach to request.state)
+        current = getattr(request.state, "structured_lab", None)
+        if isinstance(current, dict) and current:
+            latest_lab_struct_early = current
+            lab_source = "current"
         else:
-            lab = (
-                db.query(LabReport)
-                .filter(LabReport.user_id == str(user.id))
-                .order_by(LabReport.created_at.desc())
-                .first()
-            )
-            latest_lab_struct_early = lab.structured_json if (lab and lab.structured_json) else None
-            lab_source = "db" if latest_lab_struct_early is not None else "none"
+            # b) cache (per-user)
+            cached = get_latest_lab_cache(str(user.id))
+            if isinstance(cached, dict) and cached:
+                latest_lab_struct_early = cached
+                lab_source = "cache"
+            else:
+                # c) DB (most recent with non-null/non-empty structured_json)
+                candidates = (
+                    db.query(LabReport)
+                    .filter(LabReport.user_id == str(user.id), LabReport.structured_json.isnot(None))
+                    .order_by(LabReport.created_at.desc())
+                    .limit(5)
+                    .all()
+                )
+                chosen: Optional[Dict[str, Any]] = None
+                for lr in candidates:
+                    sj = getattr(lr, "structured_json", None)
+                    if isinstance(sj, dict) and sj:
+                        chosen = sj
+                        break
+                latest_lab_struct_early = chosen
+                lab_source = "db" if chosen is not None else "none"
+        # store on request for downstream consumers
+        try:
+            request.state.resolved_lab = latest_lab_struct_early
+        except Exception:
+            pass
     except Exception:
         latest_lab_struct_early = None
         lab_source = "none"
+    # Single lab_context log per request
     try:
         analyte_names: list = []
         abnormal_count = 0
@@ -1102,13 +1201,33 @@ async def chat(
         triage = {"level": "ok", "reasons": []}
 
     # Build AI prompt regardless; we may choose to skip the call
-    context, notice = build_chat_context(db, user, payload.message)
+    # Build conversation history text (last ~10 messages)
+    try:
+        hist = get_chat_history(str(user.id))
+        recent = hist[-10:]
+        hist_lines = []
+        for item in recent:
+            role = (item or {}).get("role") or "user"
+            content = (item or {}).get("content") or ""
+            if not isinstance(content, str):
+                continue
+            lbl = "User" if role == "user" else "Assistant"
+            # keep each line reasonably short in the system prompt
+            content_trim = content.strip()
+            hist_lines.append(f"{lbl}: {content_trim}")
+        history_block = "\n".join(hist_lines)
+    except Exception:
+        history_block = ""
+
+    context, notice = build_chat_context(db, user, payload.message, structured_override=latest_lab_struct_early)
     prompt = (
         "You are a helpful medical assistant. Use the provided context to answer the user's question. "
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "If context is missing, inform the user. Do not provide medical advice. "
         "Keep responses concise and easy to understand.\n\n"
         f"TRIAGE: {(triage or {}).get('level', 'low')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
+        "\n--- Conversation History (most recent first) ---\n"
+        f"{history_block}\n\n"
         f"{context}\n\n--- Symptom Parser JSON (low confidence may be noisy) ---\n"
         f"{json.dumps(pipeline_json, ensure_ascii=False)}\n\n"
         "--- Extracted Symptom Entities ---\n"
@@ -1135,7 +1254,7 @@ async def chat(
         except Exception:
             pass
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
                 r = await client.post(
                     url,
@@ -1203,6 +1322,12 @@ async def chat(
 
     # Ensure event_id key exists even when not persisted
     symptom_analysis.setdefault("event_id", None)
+
+    # Append assistant reply to history (best-effort)
+    try:
+        append_chat_history(str(user.id), "assistant", ai_explanation or "")
+    except Exception:
+        pass
 
     # Final integrity log before return: keys present in payload
     try:
@@ -1281,6 +1406,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                 logger.info({
                     "function": "lab_persist",
                     "user_id": str(user.id),
+                    "lab_report_id": str(lr.id),
                     "analyte_count": len(tests),
                     "abnormal_count": abnormal_count,
                 })
@@ -1291,7 +1417,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                 db.rollback()
             except Exception:
                 pass
-        return ExplainOut(explanation=txt)
+        return ExplainOut(explanation=txt, lab_report_id=str(lr.id))
 
     # call Gemini
     prompt = (
@@ -1345,6 +1471,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                     logger.info({
                         "function": "lab_persist",
                         "user_id": str(user.id),
+                        "lab_report_id": str(lr.id),
                         "analyte_count": len(tests),
                         "abnormal_count": abnormal_count,
                     })
@@ -1355,7 +1482,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                     db.rollback()
                 except Exception:
                     pass
-            return ExplainOut(explanation=final)
+            return ExplainOut(explanation=final, lab_report_id=str(lr.id))
     except Exception as e:
         logger.exception("explain failed")
         return ExplainOut(explanation=f"⚠️ Gemini error: {e}")
