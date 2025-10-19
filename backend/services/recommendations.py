@@ -1,7 +1,67 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 
-def recommend(profile: Optional[dict], latest_lab: Optional[dict], symptoms: List[str]) -> Dict:
+RED_FLAG_KEYWORDS: List[Tuple[str, List[str]]] = [
+    # canonical reason, variants
+    ("syncope", [
+        "fainted", "fainting", "syncope", "passed out", "pass out", "black out", "blacked out"
+    ]),
+    ("chest pain", [
+        "chest pain", "pressure in chest", "tightness in chest"
+    ]),
+    ("shortness of breath", [
+        "shortness of breath", "trouble breathing", "difficulty breathing", "breathless", "sob"
+    ]),
+    ("severe headache", [
+        "worst headache", "severe headache", "thunderclap"
+    ]),
+    ("confusion", [
+        "confusion", "confused", "disoriented"
+    ]),
+    ("neuro deficits", [
+        "one-sided weakness", "one sided weakness", "hemiparesis", "weakness on one side", "facial droop", "slurred speech"
+    ]),
+    ("uncontrolled bleeding", [
+        "uncontrolled bleeding", "heavy bleeding", "bleeding that won't stop", "bleeding won't stop"
+    ]),
+]
+
+# Concerning but non-urgent patterns map to watch level
+WATCH_PATTERNS: List[Tuple[str, List[str]]] = [
+    ("persistent symptoms", [
+        "for days", "for weeks", "for months", "persistent", "ongoing"
+    ]),
+    ("orthostatic symptoms", [
+        "orthostatic", "standing up makes me dizzy", "lightheaded when standing", "dizzy when standing", "near fainting", "near syncope"
+    ]),
+]
+
+
+def red_flag_triage(symptoms: List[str], raw_text: Optional[str]) -> Dict:
+    """Return triage level and reasons based on red-flag keywords found.
+
+    - level: 'urgent' if any red flags; otherwise 'ok'.
+    - reasons: list of canonical red-flag labels that matched.
+    """
+    text = (raw_text or "").lower()
+    sset = set((x or "").lower() for x in (symptoms or []))
+    reasons: List[str] = []
+    for label, variants in RED_FLAG_KEYWORDS:
+        if any(v in text for v in variants) or any(v in sset for v in variants):
+            reasons.append(label)
+    if reasons:
+        return {"level": "urgent", "reasons": reasons}
+    # Check watch-level patterns if not urgent
+    watch_reasons: List[str] = []
+    for label, variants in WATCH_PATTERNS:
+        if any(v in text for v in variants) or any(v in sset for v in variants):
+            watch_reasons.append(label)
+    if watch_reasons:
+        return {"level": "watch", "reasons": watch_reasons}
+    return {"level": "ok", "reasons": []}
+
+
+def recommend(profile: Optional[dict], latest_lab: Optional[dict], symptoms: List[str], raw_text: Optional[str] = None) -> Dict:
     """Rule-based initial recommendations based on symptoms and optional labs.
 
     - dizziness -> hydrate, check glucose, stand up slowly
@@ -45,6 +105,17 @@ def recommend(profile: Optional[dict], latest_lab: Optional[dict], symptoms: Lis
         # Be resilient to parsing issues; leave actions/priority as-is
         pass
 
+    # Red-flag triage elevates priority and adds urgent action
+    triage = red_flag_triage(symptoms or [], raw_text)
+    if triage.get("level") == "urgent":
+        priority = "high"
+        actions = [
+            "Seek medical attention promptly",
+            *actions,
+        ]
+    elif triage.get("level") == "watch" and priority == "low":
+        priority = "moderate"
+    
     # De-duplicate while preserving order
     actions = list(dict.fromkeys(actions))
 
@@ -52,12 +123,13 @@ def recommend(profile: Optional[dict], latest_lab: Optional[dict], symptoms: Lis
         "priority": priority,
         "actions": actions or ["Monitor symptoms and rest"],
         "follow_up": (
-            "If symptoms persist >48h, worsen, or include red flags (fainting, chest pain), seek medical care."
+            "Seek urgent care or emergency services now."
+            if triage.get("level") == "urgent"
+            else "If symptoms persist >48h, worsen, or include red flags (fainting, chest pain), seek medical care."
         ),
         "rationale": " ".join(rationale_bits)
         or "Initial self-care suggestions based on reported symptoms.",
     }
 
 
-__all__ = ["recommend"]
-
+__all__ = ["recommend", "red_flag_triage"]

@@ -33,7 +33,7 @@ from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
-from backend.services.recommendations import recommend
+from backend.services.recommendations import recommend, red_flag_triage
 from backend.routers.profile import router as profile_router
 
 # --- app & router setup ---
@@ -176,6 +176,7 @@ class ChatOut(BaseModel):
     disclaimer: str
     pipeline: Optional[Dict[str, Any]] = None
     missing_fields: Optional[List[str]] = None
+    triage: Optional[Dict[str, Any]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -674,18 +675,37 @@ async def chat(
         )
         latest_lab_struct = lab.structured_json if (lab and lab.structured_json) else None
 
-        local_recs = recommend(profile_dict, latest_lab_struct, symptom_analysis.get("symptoms", []))
+        # Compute red-flag triage and feed raw text into recommender for elevation
+        triage = red_flag_triage(symptom_analysis.get("symptoms", []), payload.message)
+        local_recs = recommend(profile_dict, latest_lab_struct, symptom_analysis.get("symptoms", []), raw_text=payload.message)
         try:
             logger.info({
                 "function": "recommend",
                 "request_id": request_id,
                 "priority": local_recs.get("priority"),
                 "actions_count": len(local_recs.get("actions", []) or []),
+                "triage_level": triage.get("level") if isinstance(triage, dict) else None,
             })
+        except Exception:
+            pass
+        try:
+            triage_log = {
+                "function": "triage",
+                "request_id": request_id,
+                "level": triage.get("level") if isinstance(triage, dict) else None,
+                "reasons": triage.get("reasons") if isinstance(triage, dict) else None,
+            }
+            if isinstance(triage, dict) and triage.get("level") == "urgent":
+                triage_log.update({
+                    "priority": local_recs.get("priority"),
+                    "first_action": (local_recs.get("actions") or [None])[0],
+                })
+            logger.info(triage_log)
         except Exception:
             pass
     except Exception:
         local_recs = {}
+        triage = {"level": "ok", "reasons": []}
 
     # Build AI prompt regardless; we may choose to skip the call
     context, notice = build_chat_context(db, user, payload.message)
@@ -694,6 +714,7 @@ async def chat(
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "If context is missing, inform the user. Do not provide medical advice. "
         "Keep responses concise and easy to understand.\n\n"
+        f"TRIAGE: {(triage or {}).get('level', 'ok')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
         f"{context}\n\n--- Symptom Parser JSON (low confidence may be noisy) ---\n"
         f"{json.dumps(pipeline_json, ensure_ascii=False)}\n\n"
         "--- Extracted Symptom Entities ---\n"
@@ -801,8 +822,9 @@ async def chat(
             "timed_out",
             "disclaimer",
             "pipeline",
+            "triage",
         ]
-        logger.info({"function": "end_chat", "request_id": request_id, "keys": top_keys, "missing_fields": missing_fields})
+        logger.info({"function": "end_chat", "request_id": request_id, "keys": top_keys, "missing_fields": missing_fields, "triage": triage})
     except Exception:
         pass
 
@@ -817,6 +839,7 @@ async def chat(
         disclaimer=disclaimer,
         pipeline={"symptom_parse": pipeline_json},
         missing_fields=missing_fields,
+        triage=triage,
     )
 
 
