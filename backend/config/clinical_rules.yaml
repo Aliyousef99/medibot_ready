@@ -1,0 +1,14 @@
+glucose:
+  very_high_mg_dl: 200
+lipids:
+  ldl:
+    elevated_mg_dl: 160
+  hdl:
+    low_mg_dl: 40
+obesity:
+  bmi_threshold: 30
+symptoms:
+  red_flags:
+    - "chest pain"
+    - "shortness of breath"
+    - "dizziness"

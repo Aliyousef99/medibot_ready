@@ -1,0 +1,87 @@
+"""NER helpers with optional BioBERT support."""
+from __future__ import annotations
+
+import os
+import re
+from functools import lru_cache
+from typing import Any, Dict, List
+
+try:  # transformers is optional; fall back to heuristics when missing
+    from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline  # type: ignore
+except Exception:  # pragma: no cover - library not installed in dev by default
+    AutoModelForTokenClassification = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+    pipeline = None  # type: ignore
+
+from backend.services.glossary import has_local_definition
+
+
+def _ensure_pipeline():
+    if pipeline is None or AutoTokenizer is None or AutoModelForTokenClassification is None:
+        return None
+    model_name = os.getenv("BIOBERT_MODEL_NAME", "dmis-lab/biobert-base-cased-v1.1")
+    try:
+        return pipeline(
+            "ner",
+            model=AutoModelForTokenClassification.from_pretrained(model_name),
+            tokenizer=AutoTokenizer.from_pretrained(model_name),
+            aggregation_strategy="simple",
+            device=-1,
+        )
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _lazy_pipeline():
+    return _ensure_pipeline()
+
+
+def _heuristic_entities(text: str) -> List[Dict[str, Any]]:
+    terms = set()
+    for word in re.findall(r"[A-Za-z][A-Za-z-]{4,}", text):
+        if has_local_definition(word.lower()):
+            terms.add(word)
+    return [
+        {
+            "text": term,
+            "label": "MEDICAL_TERM",
+            "confidence": 0.5,
+        }
+        for term in sorted(terms)
+    ]
+
+
+def detect_medical_entities(text: str) -> Dict[str, Any]:
+    pipe = _lazy_pipeline()
+    if pipe:
+        try:
+            predictions = pipe(text)
+            entities = [
+                {
+                    "text": item.get("word") or item.get("text"),
+                    "label": item.get("entity_group") or item.get("entity"),
+                    "score": float(item.get("score", 0.0)),
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                }
+                for item in predictions
+            ]
+            return {
+                "entities": entities,
+                "meta": {"engine": "biobert", "model": os.getenv("BIOBERT_MODEL_NAME", "dmis-lab/biobert-base-cased-v1.1")},
+            }
+        except Exception as exc:
+            return {
+                "entities": _heuristic_entities(text),
+                "meta": {"engine": "heuristic", "warning": f"BioBERT unavailable: {exc}"},
+            }
+    return {
+        "entities": _heuristic_entities(text),
+        "meta": {"engine": "heuristic"},
+    }
+
+
+__all__ = ["detect_medical_entities"]
+
+
