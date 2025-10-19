@@ -1,13 +1,24 @@
-﻿
-# Node
-frontend/node_modules
-frontend/dist
+﻿# Node
+node_modules/
+.vite/
+dist/
+.env
+.env.local
+*.log
 
 # Python
-backend/.venv
-__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
 
-# Env
-backend/.env
-backend/uploads
-backend/.env.example
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.zip
+*.exe
+*.dll
+*.sqlite3
