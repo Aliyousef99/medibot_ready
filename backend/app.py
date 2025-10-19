@@ -165,10 +165,13 @@ class ChatIn(BaseModel):
     message: str
 
 class ChatOut(BaseModel):
-    response: str
+    request_id: str
+    summary: Optional[str] = ""
+    symptom_analysis: Dict[str, Any]
+    local_recommendations: Dict[str, Any]
+    ai_explanation: str
+    disclaimer: str
     pipeline: Optional[Dict[str, Any]] = None
-    symptom_analysis: Optional[Dict[str, Any]] = None
-    local_recommendations: Optional[Dict[str, Any]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -582,6 +585,14 @@ async def chat(
     from backend.utils.app import build_chat_context
     from backend.services import symptoms as symp
 
+    # Generate a request_id for this chat call
+    import uuid as _uuid
+    request_id = str(_uuid.uuid4())
+    try:
+        logger.info({"function": "start_chat", "request_id": request_id})
+    except Exception:
+        pass
+
     # Run deterministic symptom parsing first
     try:
         pipeline_json = symp.summarize_to_json(payload.message).model_dump()
@@ -594,8 +605,8 @@ async def chat(
         try:
             logger.info({
                 "function": "analyze_text",
-                "symptoms": symptom_analysis.get("symptoms", []),
-                "tests": symptom_analysis.get("possible_tests", []),
+                "request_id": request_id,
+                "symptom_count": len(symptom_analysis.get("symptoms", [])),
                 "confidence": symptom_analysis.get("confidence", 0.0),
             })
         except Exception:
@@ -622,6 +633,7 @@ async def chat(
         try:
             logger.info({
                 "function": "chat_symptom_analysis_saved",
+                "request_id": request_id,
                 "event_id": ev_id,
                 "symptoms": symptom_analysis.get("symptoms", []),
                 "tests": symptom_analysis.get("possible_tests", []),
@@ -658,6 +670,7 @@ async def chat(
         try:
             logger.info({
                 "function": "recommend",
+                "request_id": request_id,
                 "priority": local_recs.get("priority"),
                 "actions_count": len(local_recs.get("actions", []) or []),
             })
@@ -666,6 +679,7 @@ async def chat(
     except Exception:
         local_recs = {}
 
+    # Build AI prompt regardless; we may choose to skip the call
     context, notice = build_chat_context(db, user, payload.message)
     prompt = (
         "You are a helpful medical assistant. Use the provided context to answer the user's question. "
@@ -680,29 +694,82 @@ async def chat(
         f"{', '.join(symptom_analysis.get('possible_tests') or []) or 'none'}\n"
     )
 
+    ai_explanation = ""
+    do_ai = True
     if pipeline_json.get("overall_confidence", 0.0) >= 0.5:
-        # Avoid Gemini; return structured parse
-        return ChatOut(response="Structured symptom analysis detected.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis, local_recommendations=local_recs)
-
+        do_ai = False
+        ai_explanation = "Structured symptom analysis provided; AI summary skipped."
     if not GEMINI_API_KEY:
-        return ChatOut(response="Chat is not configured. No API key found.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis, local_recommendations=local_recs)
+        do_ai = False
+        ai_explanation = "Chat model not configured; showing local analysis only."
+
+    timed_out = False
+    if do_ai:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+                r = await client.post(
+                    url,
+                    params={"key": GEMINI_API_KEY},
+                    headers={"Content-Type": "application/json"},
+                    json={"contents": [{"role": "user", "parts": [{"text": prompt.strip()}]}]},
+                )
+                r.raise_for_status()
+                data = r.json()
+                ai_explanation = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    or ""
+                ).strip()
+        except httpx.TimeoutException:
+            timed_out = True
+            ai_explanation = "AI explanation timed out. Please review the suggestions above."
+        except Exception as e:
+            ai_explanation = "AI explanation unavailable at the moment."
+        finally:
+            try:
+                logger.info({
+                    "function": "ai_explanation",
+                    "request_id": request_id,
+                    "timed_out": timed_out,
+                })
+            except Exception:
+                pass
+    else:
+        try:
+            logger.info({
+                "function": "ai_explanation",
+                "request_id": request_id,
+                "timed_out": False,
+            })
+        except Exception:
+            pass
+
+    # Compose summary and disclaimer
+    try:
+        n_sym = len(symptom_analysis.get("symptoms", []) or [])
+        prio = (local_recs or {}).get("priority", "low") if isinstance(local_recs, dict) else "low"
+        summary = f"Detected {n_sym} symptom(s). Priority: {prio}."
+    except Exception:
+        summary = ""
+    disclaimer = "For educational purposes only. Consult a medical professional for medical advice."
 
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-            r = await client.post(
-                url,
-                params={"key": GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
-                json={"contents": [{"role": "user", "parts": [{"text": prompt.strip()}]}]},
-            )
-            r.raise_for_status()
-            data = r.json()
-            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "") or "Could not generate a response."
-            return ChatOut(response=text.strip(), symptom_analysis=symptom_analysis, local_recommendations=local_recs)
-    except Exception as e:
-        logger.exception("Chat endpoint failed")
-        raise HTTPException(status_code=500, detail=f"Could not get a response from the chat model: {e}")
+        logger.info({"function": "end_chat", "request_id": request_id})
+    except Exception:
+        pass
+
+    return ChatOut(
+        request_id=request_id,
+        summary=summary,
+        symptom_analysis=symptom_analysis,
+        local_recommendations=local_recs or {"priority": "low", "actions": ["Monitor symptoms and rest"], "follow_up": "If symptoms persist >48h, worsen, or include red flags (fainting, chest pain), seek medical care.", "rationale": "Initial self-care suggestions based on reported symptoms."},
+        ai_explanation=ai_explanation,
+        disclaimer=disclaimer,
+        pipeline={"symptom_parse": pipeline_json},
+    )
 
 
 
