@@ -5,6 +5,7 @@ import sys
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
+from sqlalchemy import func, cast, Text as SAText
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -1051,6 +1052,7 @@ async def chat(
 
     latest_lab_struct_early: Optional[Dict[str, Any]] = None
     lab_source = "none"
+    _lab_context_logged = False
     try:
         # a) current (middleware may attach to request.state)
         current = getattr(request.state, "structured_lab", None)
@@ -1066,21 +1068,174 @@ async def chat(
                 lab_source = "cache"
             else:
                 # c) DB (most recent rows; do not assume non-null
+                # Fetch newest 10 with non-empty structured_json (raw DB filter)
+                trimmed = func.trim(cast(LabReport.structured_json, SAText))
                 candidates = (
                     db.query(LabReport)
-                    .filter(LabReport.user_id == str(user.id))
+                    .filter(
+                        LabReport.user_id == str(user.id),
+                        LabReport.structured_json.isnot(None),
+                        func.length(trimmed) > 2,
+                        trimmed.notin_(['{}', 'null', ''])
+                    )
                     .order_by(LabReport.created_at.desc())
                     .limit(10)
                     .all()
                 )
+                # summary before filtering
+                try:
+                    logger.info({
+                        "function": "lab_context_scan",
+                        "request_id": request_id,
+                        "fetched": len(candidates),
+                    })
+                except Exception:
+                    pass
                 chosen: Optional[Dict[str, Any]] = None
                 for lr in candidates:
                     sj_raw = getattr(lr, "structured_json", None)
-                    sj = _deserialize_structured(sj_raw) if not isinstance(sj_raw, dict) else (sj_raw or None)
-                    if not _is_valid_lab_obj(sj):
+                    # classify raw empties first
+                    if sj_raw is None:
+                        try:
+                            logger.info({
+                                "function": "lab_context_skip",
+                                "request_id": request_id,
+                                "reason": "empty_or_null",
+                                "lab_report_id": str(lr.id),
+                            })
+                        except Exception:
+                            pass
                         continue
-                    chosen = sj
-                    break
+                    sj: Optional[Dict[str, Any]] = None
+                    if isinstance(sj_raw, str):
+                        s = sj_raw.strip()
+                        if not s or s in ("{}", "null", "NULL", "None"):
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "empty_or_null",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            loaded = json.loads(s)
+                            sj = loaded if isinstance(loaded, dict) and loaded else None
+                        except json.JSONDecodeError:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "json_decode_error",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        if not sj:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "empty_or_null",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                    elif isinstance(sj_raw, dict):
+                        if not sj_raw:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "empty_or_null",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        sj = sj_raw
+                    else:
+                        try:
+                            logger.info({
+                                "function": "lab_context_skip",
+                                "request_id": request_id,
+                                "reason": "empty_or_null",
+                                "lab_report_id": str(lr.id),
+                            })
+                        except Exception:
+                            pass
+                        continue
+
+                    # validate analytes presence
+                    tests = sj.get("tests") if isinstance(sj, dict) else None
+                    labs_obj = sj.get("labs") if isinstance(sj, dict) and isinstance(sj.get("labs"), dict) else None
+                    analytes_list = labs_obj.get("analytes") if isinstance(labs_obj, dict) else None
+
+                    if isinstance(tests, list):
+                        if len(tests) == 0:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "analytes_empty",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            chosen = sj
+                    elif isinstance(analytes_list, list):
+                        if len(analytes_list) == 0:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "analytes_empty",
+                                    "lab_report_id": str(lr.id),
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        else:
+                            chosen = sj
+                    else:
+                        names_tmp, _ = _extract_analytes_and_abnormal(sj)
+                        if len(names_tmp) == 0:
+                            try:
+                                logger.info({
+                                    "function": "lab_context_skip",
+                                    "request_id": request_id,
+                                    "reason": "no_analytes",
+                                    "lab_report_id": str(lr.id),
+                                    "keys": list(sj.keys()) if isinstance(sj, dict) else [],
+                                })
+                            except Exception:
+                                pass
+                            continue
+                        chosen = sj
+
+                    if chosen is not None:
+                        latest_lab_struct_early = chosen
+                        lab_source = "db"
+                        try:
+                            names_ok, abn_ok = _extract_analytes_and_abnormal(chosen)
+                            logger.info({
+                                "function": "lab_context",
+                                "request_id": request_id,
+                                "source": lab_source,
+                                "has_structured_lab": True,
+                                "analyte_names": names_ok,
+                                "abnormal_count": abn_ok,
+                            })
+                            _lab_context_logged = True
+                        except Exception:
+                            pass
+                        break
                 latest_lab_struct_early = chosen
                 lab_source = "db" if chosen is not None else "none"
         # store on request for downstream consumers
@@ -1091,17 +1246,19 @@ async def chat(
     except Exception:
         latest_lab_struct_early = None
         lab_source = "none"
-    # Single lab_context log per request
+    # Single lab_context success log per request when found via current/cache (DB branch logs on success)
     try:
-        analyte_names, abnormal_count = _extract_analytes_and_abnormal(latest_lab_struct_early)
-        logger.info({
-            "function": "lab_context",
-            "request_id": request_id,
-            "source": lab_source,
-            "has_structured_lab": latest_lab_struct_early is not None,
-            "analyte_names": analyte_names,
-            "abnormal_count": abnormal_count,
-        })
+        if not _lab_context_logged and isinstance(latest_lab_struct_early, dict) and lab_source in ("current", "cache"):
+            analyte_names, abnormal_count = _extract_analytes_and_abnormal(latest_lab_struct_early)
+            logger.info({
+                "function": "lab_context",
+                "request_id": request_id,
+                "source": lab_source,
+                "has_structured_lab": True,
+                "analyte_names": analyte_names,
+                "abnormal_count": abnormal_count,
+            })
+            _lab_context_logged = True
     except Exception:
         pass
 
