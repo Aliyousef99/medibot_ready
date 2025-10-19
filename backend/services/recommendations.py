@@ -141,4 +141,39 @@ def recommend(profile: Optional[dict], latest_lab: Optional[dict], symptoms: Lis
     }
 
 
-__all__ = ["recommend", "red_flag_triage"]
+def lab_triage(structured_lab: Optional[dict]) -> Dict:
+    """Inspect structured labs and return a triage with level and reasons.
+
+    Expected structured_lab shape includes a list under 'tests' where each test may have:
+      - name, value (float), unit, abnormal ('high'|'low'|'normal'|'unknown'), ref_min/ref_max.
+    """
+    if not structured_lab or not isinstance(structured_lab, dict):
+        return {"level": "low", "reasons": [], "suggested_window": "routine follow-up"}
+
+    tests = structured_lab.get("tests") or []
+    reasons: List[str] = []
+    level: str = "low"
+
+    for t in tests:
+        try:
+            name = str(t.get("name") or "").strip().lower()
+            val = float(t.get("value")) if t.get("value") is not None else None
+            unit = (t.get("unit") or "").lower()
+            abnormal = (t.get("abnormal") or t.get("status") or "unknown").lower()
+
+            # Ferritin severe elevation
+            if name == "ferritin" and val is not None and unit in ("ng/ml",) and val >= 1000:
+                level = "high"
+                reasons.append("Ferritin markedly elevated vs ref 10–120 ng/mL")
+
+            # Any abnormal value elevates to at least moderate
+            if abnormal in ("high", "low") and level == "low":
+                level = "moderate"
+        except Exception:
+            continue
+
+    suggested_window = "as soon as practical" if level in ("moderate", "high") else "routine follow-up"
+    return {"level": level, "reasons": reasons, "suggested_window": suggested_window}
+
+
+__all__ = ["recommend", "red_flag_triage", "lab_triage"]

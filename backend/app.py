@@ -33,7 +33,7 @@ from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
-from backend.services.recommendations import recommend, red_flag_triage
+from backend.services.recommendations import recommend, red_flag_triage, lab_triage
 from backend.routers.profile import router as profile_router
 
 # --- app & router setup ---
@@ -890,9 +890,48 @@ async def chat(
         )
         latest_lab_struct = lab.structured_json if (lab and lab.structured_json) else None
 
-        # Compute red-flag triage and feed raw text into recommender for elevation
-        triage = red_flag_triage(symptom_analysis.get("symptoms", []), payload.message)
+        # Compute triage from red flags and labs
+        rf = red_flag_triage(symptom_analysis.get("symptoms", []), payload.message)
+        lt = lab_triage(latest_lab_struct)
+        # Normalize triage to low/moderate/high scale
+        # If red flags urgent -> treat as 'high'
+        level_map = {"ok": "low", "watch": "moderate", "urgent": "high"}
+        rf_level = level_map.get(rf.get("level"), "low") if isinstance(rf, dict) else "low"
+        # Choose the higher of lab and red-flag levels
+        order = ["low", "moderate", "high"]
+        def max_level(a: str, b: str) -> str:
+            return a if order.index(a) >= order.index(b) else b
+        triage_level = max_level(lt.get("level", "low"), rf_level)
+        triage_reasons = []
+        if isinstance(lt, dict):
+            triage_reasons += lt.get("reasons", []) or []
+        if isinstance(rf, dict) and rf.get("reasons"):
+            triage_reasons += [f"red flag: {r}" for r in rf.get("reasons")]
+        triage_window = lt.get("suggested_window") if triage_level != "low" else "routine follow-up"
+        triage = {"level": triage_level, "reasons": triage_reasons, "suggested_window": triage_window}
+
+        # Build recommendations and then sync priority with triage
         local_recs = recommend(profile_dict, latest_lab_struct, symptom_analysis.get("symptoms", []), raw_text=payload.message)
+        try:
+            # Map triage level to priority
+            tri_to_pri = {"high": "high", "moderate": "moderate", "low": "low"}
+            mapped = tri_to_pri.get(triage_level, local_recs.get("priority", "low"))
+            local_recs["priority"] = mapped
+            if triage_level == "high":
+                # Ensure urgent prompts present
+                urgent_action = "Seek medical attention promptly"
+                if urgent_action not in (local_recs.get("actions") or []):
+                    local_recs["actions"] = [urgent_action] + (local_recs.get("actions") or [])
+                # Add explicit clinician follow-up
+                follow = local_recs.get("follow_up") or ""
+                if "urgent care" not in follow.lower() and "emergency" not in follow.lower():
+                    local_recs["follow_up"] = "Seek urgent care or emergency services now."
+                # Ensure explicit clinician follow-up action appears
+                add_action = "Arrange clinician follow-up to review abnormal labs"
+                if add_action not in (local_recs.get("actions") or []):
+                    local_recs["actions"].append(add_action)
+        except Exception:
+            pass
         try:
             logger.info({
                 "function": "recommend",
@@ -900,6 +939,16 @@ async def chat(
                 "priority": local_recs.get("priority"),
                 "actions_count": len(local_recs.get("actions", []) or []),
                 "triage_level": triage.get("level") if isinstance(triage, dict) else None,
+            })
+        except Exception:
+            pass
+        # compact triage log
+        try:
+            logger.info({
+                "function": "triage",
+                "request_id": request_id,
+                "level": triage.get("level"),
+                "reason_count": len(triage.get("reasons", [])),
             })
         except Exception:
             pass
@@ -929,7 +978,7 @@ async def chat(
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "If context is missing, inform the user. Do not provide medical advice. "
         "Keep responses concise and easy to understand.\n\n"
-        f"TRIAGE: {(triage or {}).get('level', 'ok')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
+        f"TRIAGE: {(triage or {}).get('level', 'low')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
         f"{context}\n\n--- Symptom Parser JSON (low confidence may be noisy) ---\n"
         f"{json.dumps(pipeline_json, ensure_ascii=False)}\n\n"
         "--- Extracted Symptom Entities ---\n"
