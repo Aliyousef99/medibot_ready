@@ -175,6 +175,7 @@ class ChatOut(BaseModel):
     timed_out: Optional[bool] = None
     disclaimer: str
     pipeline: Optional[Dict[str, Any]] = None
+    missing_fields: Optional[List[str]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -650,9 +651,10 @@ async def chat(
 
     # Build local recommendations block using profile + latest lab + reported symptoms
     local_recs: Dict[str, Any] = {}
+    latest_lab_struct = None
+    profile_dict = None
     try:
         prof = db.query(UserProfile).filter(UserProfile.user_id == str(user.id)).first()
-        profile_dict = None
         if prof is not None:
             try:
                 profile_dict = {
@@ -758,6 +760,23 @@ async def chat(
             except Exception:
                 pass
 
+    # Compute missing context fields for guided completion banner
+    missing_fields: List[str] = []
+    try:
+        if not profile_dict or profile_dict.get("age") in (None, ""):
+            missing_fields.append("age")
+        if not profile_dict or not (profile_dict.get("sex") or "").strip():
+            missing_fields.append("sex")
+        if not profile_dict or not (profile_dict.get("conditions") or []):
+            missing_fields.append("conditions")
+        if not profile_dict or not (profile_dict.get("medications") or []):
+            missing_fields.append("medications")
+        if latest_lab_struct is None:
+            missing_fields.append("latest_lab")
+    except Exception:
+        # Non-fatal
+        pass
+
     # Compose summary and disclaimer
     try:
         n_sym = len(symptom_analysis.get("symptoms", []) or [])
@@ -783,7 +802,7 @@ async def chat(
             "disclaimer",
             "pipeline",
         ]
-        logger.info({"function": "end_chat", "request_id": request_id, "keys": top_keys})
+        logger.info({"function": "end_chat", "request_id": request_id, "keys": top_keys, "missing_fields": missing_fields})
     except Exception:
         pass
 
@@ -797,6 +816,7 @@ async def chat(
         timed_out=timed_out,
         disclaimer=disclaimer,
         pipeline={"symptom_parse": pipeline_json},
+        missing_fields=missing_fields,
     )
 
 

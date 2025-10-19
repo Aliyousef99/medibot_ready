@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
-import { Send, Plus, MessageSquare, Trash2, Moon, Sun, Bot, User, Menu, Loader2, ShieldAlert } from "lucide-react";
+import { Send, Plus, MessageSquare, Trash2, Moon, Sun, Bot, User, Menu, Loader2, ShieldAlert, Copy } from "lucide-react";
 import UserMenu from "./UserMenu";
 import {
   register as apiRegister,
@@ -11,6 +11,7 @@ import {
   extractText as apiExtract,
   analyzeSymptoms as apiAnalyzeSymptoms,
 } from "../services/api"; // <-- relative path is key
+import type { ChatResponseCombined } from "../services/api";
 
 
 // ---------- Types ----------
@@ -28,6 +29,14 @@ type Message = {
   role: Role;
   content: string;
   ts: Date;
+  // DEV-only fields rendered under assistant message
+  requestId?: string;
+  symptomAnalysis?: { symptoms?: string[]; possible_tests?: string[]; confidence?: number; event_id?: string | null };
+  localRecommendations?: { priority: string; actions: string[]; follow_up: string; rationale: string };
+  disclaimer?: string;
+  // DEV: keys from the raw /api/chat object for quick shape verification
+  rawKeys?: string[];
+  aiSource?: 'model' | 'fallback' | 'skipped';
 };
 
 type Conversation = {
@@ -312,22 +321,30 @@ export default function ClassicChatbotUI() {
   // Per-conversation analysis state
   const [structuredById, setStructuredById] = useState<Record<string, any>>({});
   const [explanationById, setExplanationById] = useState<Record<string, string>>({});
+  const [explanationSourceById, setExplanationSourceById] = useState<Record<string, 'model'|'fallback'|'skipped'|undefined>>({});
   const [dark, setDark] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [profileOpen, setProfileOpen] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>(initialConversations);
   const [activeId, setActiveId] = useState<string | null>(() => initialConversations[0]?.id ?? null);
   const [input, setInput] = useState("");
+  const [missingFieldsById, setMissingFieldsById] = useState<Record<string, string[]>>({});
+  const [hideProfileBanner, setHideProfileBanner] = useState<boolean>(() => {
+    try { return sessionStorage.getItem('hideProfileBanner') === '1'; } catch { return false; }
+  });
   const structured = activeId ? structuredById[activeId] ?? null : null;
   const explanation = activeId ? explanationById[activeId] ?? "" : "";
   // Precompute sanitized explanation at top-level so hooks order remains stable
-  const sanitizedExplanation = useMemo(
-    () => DOMPurify.sanitize(explanation || "â€”", { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }),
-    [explanation]
-  );
+  const sanitizedExplanation = useMemo(() => {
+    const text = explanation && explanation.trim().length > 0
+      ? explanation
+      : "AI explanation unavailable; showing structured recommendations.";
+    return DOMPurify.sanitize(text, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
+  }, [explanation]);
   const [busy, setBusy] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   type SymptomAnalysisResult = {
     urgency: string;
     summary: string;
@@ -356,6 +373,7 @@ export default function ClassicChatbotUI() {
     // init per-conversation analysis slots without wiping others
     setStructuredById((s) => ({ ...s, [id]: null }));
     setExplanationById((s) => ({ ...s, [id]: "" }));
+    setExplanationSourceById((s) => ({ ...s, [id]: undefined }));
     setSymptomAnalysisResult(null);
   }
 
@@ -419,13 +437,30 @@ export default function ClassicChatbotUI() {
     setInput("");
 
     try {
-      const chatResponse = await apiChat(text);
-      const safe = DOMPurify.sanitize(chatResponse.response ?? "", { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
+      const chatResponse: ChatResponseCombined = await apiChat(text);
+      // Update side panels with pipeline + AI explanation
+      if (activeId) {
+        setStructuredById((s) => ({ ...s, [activeId]: chatResponse.pipeline || null }));
+        setExplanationById((s) => ({ ...s, [activeId]: chatResponse.ai_explanation || '' }));
+        setExplanationSourceById((s) => ({ ...s, [activeId]: (chatResponse.ai_explanation_source as any) }));
+        if (Array.isArray(chatResponse.missing_fields)) {
+          setMissingFieldsById((m) => ({ ...m, [activeId]: chatResponse.missing_fields as any }));
+          setHideProfileBanner((prev) => prev || (chatResponse.missing_fields || []).length === 0);
+        }
+      }
+      const assistantText = chatResponse.ai_explanation || chatResponse.summary || "";
+      const safe = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
       const botMessage: Message = {
         id: `m_${Date.now() + 1}`,
         role: "assistant",
         content: safe,
         ts: new Date(),
+        requestId: chatResponse.request_id,
+        symptomAnalysis: chatResponse.symptom_analysis,
+        localRecommendations: chatResponse.local_recommendations,
+        disclaimer: chatResponse.disclaimer,
+        rawKeys: Object.keys(chatResponse || {}),
+        aiSource: (chatResponse as any).ai_explanation_source,
       };
       applyToActive((msgs) => [...msgs, botMessage]);
     } catch (err: any) {
@@ -446,6 +481,8 @@ export default function ClassicChatbotUI() {
     try {
       const { text } = await apiExtract(file);
       setInput(text);
+      // After upload, re-run the last user message to reflect improved context
+      rerunLastMessage(/*reason*/'lab_upload');
     } catch (e: any) {
       const botMsg: Message = {
         id: `m_${Date.now() + 2}`,
@@ -457,6 +494,51 @@ export default function ClassicChatbotUI() {
     } finally {
       setFileBusy(false);
     }
+  }
+
+  function rerunLastMessage(reason?: string) {
+    if (!active) return;
+    const lastUser = [...(active.messages || [])].reverse().find((m) => m.role === 'user');
+    if (!lastUser) return;
+    // dev hint: show previous req id for correlation
+    if (process.env.NODE_ENV !== 'production') {
+      const lastAssistant = [...(active.messages || [])].reverse().find((m) => m.role === 'assistant' && m.requestId);
+      // eslint-disable-next-line no-console
+      console.debug('Re-running last message', { reason, prev_request_id: lastAssistant?.requestId, prompt: lastUser.content });
+    }
+    (async () => {
+      try {
+        setBusy(true);
+        const resp: ChatResponseCombined = await apiChat(lastUser.content);
+        if (activeId) {
+          setStructuredById((s) => ({ ...s, [activeId]: resp.pipeline || null }));
+          setExplanationById((s) => ({ ...s, [activeId]: resp.ai_explanation || '' }));
+          setExplanationSourceById((s) => ({ ...s, [activeId]: (resp.ai_explanation_source as any) }));
+          if (Array.isArray(resp.missing_fields)) {
+            setMissingFieldsById((m) => ({ ...m, [activeId]: resp.missing_fields as any }));
+          }
+        }
+        const assistantText = resp.ai_explanation || resp.summary || "";
+        const safeText = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
+        const msg: Message = {
+          id: `m_${Date.now() + 3}`,
+          role: 'assistant',
+          content: safeText,
+          ts: new Date(),
+          requestId: resp.request_id,
+          symptomAnalysis: resp.symptom_analysis,
+          localRecommendations: resp.local_recommendations,
+          disclaimer: resp.disclaimer,
+          rawKeys: Object.keys(resp || {}),
+          aiSource: (resp as any).ai_explanation_source,
+        };
+        applyToActive((msgs) => [...msgs, msg]);
+        try { sessionStorage.setItem('hideProfileBanner', '1'); } catch {}
+        setHideProfileBanner(true);
+      } finally {
+        setBusy(false);
+      }
+    })();
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -572,6 +654,10 @@ export default function ClassicChatbotUI() {
                   const updated = { ...user, profile: p };
                   setUser(updated);
                   localStorage.setItem("auth", JSON.stringify(updated));
+                  // Re-run last message to reflect improved profile context
+                  rerunLastMessage('profile_update');
+                  try { sessionStorage.setItem('hideProfileBanner','1'); } catch {}
+                  setHideProfileBanner(true);
                 }}
               />
             )}
@@ -582,6 +668,35 @@ export default function ClassicChatbotUI() {
             <div className="font-semibold tracking-tight">{active?.title || "Chat"}</div>
           </div>
 
+          {!hideProfileBanner && Array.isArray(missingFieldsById[activeId || '']) && (missingFieldsById[activeId || '']?.length || 0) > 0 && (
+            <div className="mx-4 mt-3 rounded-xl border border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200 p-3 flex items-center gap-3">
+              <ShieldAlert className="w-5 h-5" />
+              <div className="flex-1 text-sm">
+                <div className="font-medium mb-0.5">To personalize guidance, add: {missingFieldsById[activeId || ''].join(', ')}.</div>
+                <div className="text-[12px] opacity-80">This banner appears once per session.</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  onClick={() => setProfileOpen(true)}
+                >
+                  Open Profile
+                </button>
+                <button
+                  className="text-xs px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  onClick={() => uploadInputRef.current?.click()}
+                >
+                  Upload Lab
+                </button>
+                <button
+                  className="text-xs px-2 py-1 rounded-lg text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  onClick={() => { try { sessionStorage.setItem('hideProfileBanner','1'); } catch {}; setHideProfileBanner(true); }}
+                >
+                  Don’t show again
+                </button>
+              </div>
+            </div>
+          )}
           <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 lg:p-6 space-y-4">
             {active?.messages?.length ? (
               active.messages.map((m) => <ChatMessage key={m.id} msg={m} />)
@@ -603,6 +718,7 @@ export default function ClassicChatbotUI() {
                     <input
                       type="file"
                       className="hidden"
+                      ref={uploadInputRef}
                       onChange={(e) => e.target.files && onFilePicked(e.target.files[0])}
                       disabled={fileBusy}
                     />
@@ -702,7 +818,25 @@ export default function ClassicChatbotUI() {
               )}
             </ul>
 
-            <div className="text-xs uppercase tracking-wide text-zinc-400">Explanation (Gemini)</div>
+            <div className="flex items-center justify-between">
+              <div className="text-xs uppercase tracking-wide text-zinc-400">AI Explanation</div>
+              <div className="flex items-center gap-2">
+                {process.env.NODE_ENV !== 'production' && (
+                  <span className="text-[10px] text-zinc-400">source: {explanationSourceById[activeId || ''] || 'unknown'}</span>
+                )}
+                <button
+                  className="text-[11px] px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1"
+                  onClick={() => {
+                    try {
+                      navigator.clipboard.writeText(explanation || "");
+                    } catch {}
+                  }}
+                  title="Copy AI explanation"
+                >
+                  <Copy className="w-3 h-3" /> Copy
+                </button>
+              </div>
+            </div>
             <div className="text-xs uppercase tracking-wide text-zinc-400">User Profile</div>
             <pre className="text-xs whitespace-pre-wrap break-words rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900">
               {user?.profile ? JSON.stringify(user.profile, null, 2) : "â€”"}
@@ -757,7 +891,53 @@ function ChatMessage({ msg }: { msg: Message }) {
         }`}
       >
         <div>{useMemo(() => DOMPurify.sanitize(msg.content, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }), [msg.content])}</div>
-        <div className="mt-1 text-[10px] text-zinc-400">{formatTime(msg.ts)}</div>
+        {/* Render structured extras for assistant messages */}
+        {!isUser && msg.localRecommendations && (
+          <div className="mt-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-3">
+            <div className="text-xs uppercase tracking-wide text-zinc-500 mb-1">Recommendations</div>
+            <div className="text-[13px] mb-2">Priority: {msg.localRecommendations.priority || 'low'}</div>
+            {/* DEV/Info: show event_id and confidence from symptom_analysis to ensure we read them */}
+            {(msg.symptomAnalysis?.event_id || typeof msg.symptomAnalysis?.confidence === 'number') && (
+              <div className="text-[11px] text-zinc-500 mb-2">
+                {msg.symptomAnalysis?.event_id ? <span>Event: {msg.symptomAnalysis.event_id}</span> : null}
+                {msg.symptomAnalysis?.event_id && typeof msg.symptomAnalysis?.confidence === 'number' ? <span> • </span> : null}
+                {typeof msg.symptomAnalysis?.confidence === 'number' ? (
+                  <span>Confidence: {Math.round((msg.symptomAnalysis.confidence || 0) * 100)}%</span>
+                ) : null}
+              </div>
+            )}
+            <ul className="list-disc pl-5 space-y-1 text-[13px]">
+              {msg.localRecommendations.actions?.map((a, i) => (
+                <li key={i}>{a}</li>
+              ))}
+            </ul>
+            {msg.symptomAnalysis?.symptoms?.length ? (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {msg.symptomAnalysis.symptoms.slice(0, 8).map((s, i) => (
+                  <span key={i} className="px-2 py-0.5 rounded-full bg-zinc-200 dark:bg-zinc-800 text-[11px]">{s}</span>
+                ))}
+              </div>
+            ) : null}
+            {msg.disclaimer && (
+              <div className="mt-3 text-[11px] text-zinc-500">{msg.disclaimer}</div>
+            )}
+          </div>
+        )}
+        {/* DEV-only keys list to confirm payload shape */}
+        {!isUser && process.env.NODE_ENV !== 'production' && msg.rawKeys?.length ? (
+          <div className="mt-1 text-[10px] text-zinc-400">keys: [{msg.rawKeys.join(', ')}]</div>
+        ) : null}
+        <div className="mt-1 text-[10px] text-zinc-400 flex items-center justify-between">
+          <span>{formatTime(msg.ts)}</span>
+          {/* DEV-only footer showing request_id and source */}
+          {!isUser && process.env.NODE_ENV !== 'production' ? (
+            <span className="ml-2">
+              {msg.requestId ? `req: ${msg.requestId}` : ''}
+              {msg.requestId && msg.aiSource ? ' | ' : ''}
+              {msg.aiSource ? `source: ${msg.aiSource}` : ''}
+            </span>
+          ) : null}
+        </div>
       </div>
     </div>
   );

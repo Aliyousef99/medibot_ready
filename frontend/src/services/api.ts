@@ -1,5 +1,28 @@
 import axios from 'axios';
 
+export interface ChatResponseCombined {
+  request_id: string;
+  summary?: string;
+  symptom_analysis: {
+    symptoms?: string[];
+    possible_tests?: string[];
+    confidence?: number;
+    event_id?: string | null;
+  };
+  local_recommendations: {
+    priority: string;
+    actions: string[];
+    follow_up: string;
+    rationale: string;
+  };
+  ai_explanation: string;
+  ai_explanation_source?: 'model' | 'fallback' | 'skipped';
+  timed_out?: boolean;
+  disclaimer: string;
+  pipeline?: any;
+  missing_fields?: string[];
+}
+
 export interface SymptomAnalysisResult {
   summary: string;
   symptoms: { text: string; label: string; score: number; negated: boolean }[];
@@ -78,9 +101,33 @@ export const extractText = async (file: File): Promise<{ text: string }> => {
     return response.data;
 };
 
-export const postChatMessage = async (message: string): Promise<{ response: string }> => {
-    const response = await api.post('/api/chat', { message });
-    return response.data;
+export const postChatMessage = async (message: string): Promise<ChatResponseCombined> => {
+  const response = await api.post('/api/chat', { message });
+  if (process.env.NODE_ENV !== 'production') {
+    // DEV: Log RAW payload before any transformation and explicitly surface required keys
+    // eslint-disable-next-line no-console
+    console.debug('CHAT /api/chat RAW', response.data);
+    const {
+      request_id,
+      summary,
+      symptom_analysis,
+      local_recommendations,
+      ai_explanation,
+      disclaimer,
+      pipeline,
+    } = (response?.data ?? {}) as Partial<ChatResponseCombined> as any;
+    // eslint-disable-next-line no-console
+    console.debug('CHAT /api/chat KEYS CHECK', {
+      request_id,
+      summary,
+      symptom_analysis,
+      local_recommendations,
+      ai_explanation,
+      disclaimer,
+      pipeline,
+    });
+  }
+  return response.data as ChatResponseCombined;
 };
 
 // ---------- History (Labs) ----------
