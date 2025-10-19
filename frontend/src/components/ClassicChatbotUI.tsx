@@ -9,9 +9,9 @@ import {
   updateProfile as apiUpdateProfile,
   postChatMessage as apiChat,
   extractText as apiExtract,
-  analyzeSymptoms as apiAnalyzeSymptoms,
 } from "../services/api"; // <-- relative path is key
 import type { ChatResponseCombined } from "../services/api";
+import LabSummaryCard from "./LabSummaryCard";
 
 
 // ---------- Types ----------
@@ -37,6 +37,7 @@ type Message = {
   // DEV: keys from the raw /api/chat object for quick shape verification
   rawKeys?: string[];
   aiSource?: 'model' | 'fallback' | 'skipped';
+  rawResponse?: ChatResponseCombined;
 };
 
 type Conversation = {
@@ -67,7 +68,7 @@ function seedMessages(): Message[] {
       id: "m1",
       role: "assistant",
       ts: new Date(Date.now() - 1000 * 60 * 3),
-      content: "Hey! I'm your demo assistant. Paste lab text or upload a file.",
+      content: "",
     },
   ];
 }
@@ -353,6 +354,27 @@ export default function ClassicChatbotUI() {
     symptoms: { text: string; label: string; score: number; negated?: boolean }[];
   };
   const [symptomAnalysisResult, setSymptomAnalysisResult] = useState<SymptomAnalysisResult | null>(null);
+  const [devMode, setDevMode] = useState<boolean>(() => {
+    try {
+      const v = localStorage.getItem('medibot.devMode');
+      return v === '1' || v === 'true';
+    } catch { return false; }
+  });
+
+  useEffect(() => {
+    try { localStorage.setItem('medibot.devMode', devMode ? '1' : '0'); } catch {}
+  }, [devMode]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'd' || e.key === 'D')) {
+        e.preventDefault();
+        setDevMode((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const active = useMemo(() => {
     return conversations.find((c) => c.id === activeId) ?? null;
@@ -408,27 +430,6 @@ export default function ClassicChatbotUI() {
     );
   }
 
-  async function handleAnalyzeSymptoms() {
-    const text = input.trim();
-    if (!text || !user) return;
-
-    setBusy(true);
-    try {
-      const result = await apiAnalyzeSymptoms(text);
-      setSymptomAnalysisResult(result);
-      const botMessage: Message = {
-        id: `m_${Date.now() + 1}`,
-        role: "assistant",
-        content: result.summary || "Symptom analysis complete.",
-        ts: new Date(),
-      };
-      applyToActive((msgs) => [...msgs, botMessage]);
-    } catch (err: any) {
-      // Handle error in UI if needed
-    } finally {
-      setBusy(false);
-    }
-  }
   async function handleSend() {
     const text = input.trim();
     if (!text || !user) return;
@@ -452,6 +453,19 @@ export default function ClassicChatbotUI() {
         if (chatResponse.triage) {
           setTriageById((t) => ({ ...t, [activeId]: chatResponse.triage as any }));
         }
+        // Fuse analysis into Send: map symptom_analysis to the side panel shape (dev mode panel)
+        try {
+          const sa = chatResponse.symptom_analysis as any;
+          if (sa && (Array.isArray(sa.symptoms) || Array.isArray(sa.possible_tests))) {
+            const n = (sa.symptoms || []).length;
+            const conf = typeof sa.confidence === 'number' ? Math.round(sa.confidence * 100) : undefined;
+            const tri = chatResponse.triage as any;
+            const urgency = (tri && tri.level) ? String(tri.level) : 'low';
+            const summary = `Detected ${n} symptom(s)${typeof conf === 'number' ? ` (confidence ${conf}%)` : ''}.`;
+            const items = (sa.symptoms || []).map((txt: string) => ({ text: String(txt), label: 'symptom', score: typeof sa.confidence === 'number' ? sa.confidence : 0.5, negated: false }));
+            setSymptomAnalysisResult({ urgency, summary, symptoms: items });
+          }
+        } catch {}
       }
       const assistantText = chatResponse.ai_explanation || chatResponse.summary || "";
       const safe = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
@@ -466,6 +480,7 @@ export default function ClassicChatbotUI() {
         disclaimer: chatResponse.disclaimer,
         rawKeys: Object.keys(chatResponse || {}),
         aiSource: (chatResponse as any).ai_explanation_source,
+        rawResponse: chatResponse,
       };
       applyToActive((msgs) => [...msgs, botMessage]);
     } catch (err: any) {
@@ -537,6 +552,7 @@ export default function ClassicChatbotUI() {
           disclaimer: resp.disclaimer,
           rawKeys: Object.keys(resp || {}),
           aiSource: (resp as any).ai_explanation_source,
+          rawResponse: resp,
         };
         applyToActive((msgs) => [...msgs, msg]);
         try { sessionStorage.setItem('hideProfileBanner', '1'); } catch {}
@@ -738,7 +754,7 @@ export default function ClassicChatbotUI() {
           )}
           <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 lg:p-6 space-y-4">
             {active?.messages?.length ? (
-              active.messages.map((m) => <ChatMessage key={m.id} msg={m} />)
+              active.messages.map((m) => <ChatMessage key={m.id} msg={m} devMode={devMode} />)
             ) : (
               <EmptyState />
             )}
@@ -786,15 +802,6 @@ export default function ClassicChatbotUI() {
                     {busy ? <><Loader2 className="w-4 h-4 animate-spin" /> Working...</> : <><Send className="w-4 h-4" /> Send</>}
                   </button>
                   {/* Analyze Symptoms Button */}
-                  <button
-                    onClick={handleAnalyzeSymptoms}
-                    className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-amber-600 text-white hover:bg-amber-500 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-400"
-                    disabled={!input.trim() || busy || fileBusy}
-                    title="Analyze for Symptoms"
-                    aria-label="Analyze for symptoms"
-                  >
-                    {busy ? <><Loader2 className="w-4 h-4 animate-spin" /> Working...</> : <><Send className="w-4 h-4" /> Send</>}
-                  </button>
                 </div>
               </div>
             </div>
@@ -803,7 +810,14 @@ export default function ClassicChatbotUI() {
 
         {/* Right rail: Structured JSON & Explanation */}
         <section className="hidden lg:flex flex-col overflow-hidden border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950">
-          <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 text-sm font-semibold">Analysis</div>
+          <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 text-sm font-semibold flex items-center gap-3">
+            <span>Analysis</span>
+            <label className="ml-auto inline-flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+              <input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
+              Dev Mode (Ctrl+D)
+            </label>
+          </div>
+          {devMode && (
           <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
             <div className="text-xs uppercase tracking-wide text-zinc-400">Structured (BioBERT-style)</div>
             <pre className="text-xs whitespace-pre-wrap break-words rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900">
@@ -887,7 +901,8 @@ export default function ClassicChatbotUI() {
               {sanitizedExplanation}
             </div>
           </div>
-          {symptomAnalysisResult && (
+          )}
+          {devMode && symptomAnalysisResult && (
             <div className="p-3 space-y-3">
               <div className="text-xs uppercase tracking-wide text-zinc-400">Symptom Analysis</div>
               <div className={`text-sm rounded-xl border p-3 bg-zinc-50 dark:bg-zinc-900
@@ -918,8 +933,11 @@ export default function ClassicChatbotUI() {
   
 }
 
-function ChatMessage({ msg }: { msg: Message }) {
+function ChatMessage({ msg, devMode }: { msg: Message, devMode?: boolean }) {
   const isUser = msg.role === "user";
+  const safe = useMemo(() => DOMPurify.sanitize(msg.content, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }), [msg.content]);
+  const uv = (msg.rawResponse as any)?.user_view as any | undefined;
+  const hasUserView = !!uv && (Array.isArray(uv.abnormal) || Array.isArray(uv.normal));
   return (
     <div className={`flex items-start gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
       <div className={`rounded-full p-2 ${isUser ? "bg-blue-600 text-white" : "bg-emerald-600 text-white"}`}>
@@ -932,77 +950,23 @@ function ChatMessage({ msg }: { msg: Message }) {
             : "bg-white dark:bg-zinc-950 border-zinc-200 dark:border-zinc-800"
         }`}
       >
-        <div>{useMemo(() => DOMPurify.sanitize(msg.content, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }), [msg.content])}</div>
-        {/* Render structured extras for assistant messages */}
-        {!isUser && msg.localRecommendations && (
-          <div className="mt-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 p-3">
-            <div className="flex items-center justify-between mb-1">
-              <div className="text-xs uppercase tracking-wide text-zinc-500">Recommendations</div>
-              <button
-                className="text-[11px] px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-400"
-                onClick={() => {
-                  try {
-                    const lines = [
-                      `Priority: ${msg.localRecommendations?.priority || 'low'}`,
-                      ...(msg.localRecommendations?.actions || []).map((a) => `- ${a}`),
-                      msg.localRecommendations?.follow_up ? `Follow-up: ${msg.localRecommendations.follow_up}` : '',
-                    ].filter(Boolean);
-                    navigator.clipboard.writeText(lines.join('\n'));
-                  } catch {}
-                }}
-                title="Copy recommendations"
-                aria-label="Copy recommendations"
-              >
-                <Copy className="w-3 h-3" /> Copy
-              </button>
-            </div>
-            <div className="text-[13px] mb-2">Priority: {msg.localRecommendations.priority || 'low'}
-              {msg.localRecommendations.priority?.toLowerCase() === 'high' && (
-                <span className="ml-2 inline-flex items-center px-2 py-0.5 text-[10px] rounded-full border border-red-300 text-red-700 bg-red-50 dark:border-red-700 dark:text-red-200 dark:bg-red-900/30">High</span>
-              )}
-            </div>
-            {/* DEV/Info: show event_id and confidence from symptom_analysis to ensure we read them */}
-            {(msg.symptomAnalysis?.event_id || typeof msg.symptomAnalysis?.confidence === 'number') && (
-              <div className="text-[11px] text-zinc-500 mb-2">
-                {msg.symptomAnalysis?.event_id ? <span>Event: {msg.symptomAnalysis.event_id}</span> : null}
-                {msg.symptomAnalysis?.event_id && typeof msg.symptomAnalysis?.confidence === 'number' ? <span> • </span> : null}
-                {typeof msg.symptomAnalysis?.confidence === 'number' ? (
-                  <span>Confidence: {Math.round((msg.symptomAnalysis.confidence || 0) * 100)}%</span>
-                ) : null}
-              </div>
-            )}
-            <ul className="list-disc pl-5 space-y-1 text-[13px]">
-              {msg.localRecommendations.actions?.map((a, i) => (
-                <li key={i}>{a}</li>
-              ))}
-            </ul>
-            {msg.symptomAnalysis?.symptoms?.length ? (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {msg.symptomAnalysis.symptoms.slice(0, 8).map((s, i) => (
-                  <span key={i} className="px-2 py-0.5 rounded-full bg-zinc-200 dark:bg-zinc-800 text-[11px]">{s}</span>
-                ))}
-              </div>
-            ) : null}
-            {msg.disclaimer && (
-              <div className="mt-3 text-[11px] text-zinc-500">{msg.disclaimer}</div>
-            )}
-          </div>
+        {isUser ? (
+          <div>{safe}</div>
+        ) : hasUserView ? (
+          <LabSummaryCard response={msg.rawResponse} aiText={msg.content} devMode={!!devMode} />
+        ) : (
+          <div>{safe}</div>
         )}
-        {/* DEV-only keys list to confirm payload shape */}
-        {!isUser && process.env.NODE_ENV !== 'production' && msg.rawKeys?.length ? (
-          <div className="mt-1 text-[10px] text-zinc-400">keys: [{msg.rawKeys.join(', ')}]</div>
-        ) : null}
-        <div className="mt-1 text-[10px] text-zinc-400 flex items-center justify-between">
-          <span>{formatTime(msg.ts)}</span>
-          {/* DEV-only footer showing request_id and source */}
-          {!isUser && process.env.NODE_ENV !== 'production' ? (
+        {!isUser && devMode && (
+          <div className="mt-2 text-[10px] text-zinc-400 flex items-center justify-between">
+            <span>{formatTime(msg.ts)}</span>
             <span className="ml-2">
               {msg.requestId ? `req: ${msg.requestId}` : ''}
               {msg.requestId && msg.aiSource ? ' | ' : ''}
               {msg.aiSource ? `source: ${msg.aiSource}` : ''}
             </span>
-          ) : null}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

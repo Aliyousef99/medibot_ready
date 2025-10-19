@@ -31,22 +31,24 @@ def _profile_lines(profile: Optional[UserProfile]) -> str:
     ]
     return "\n".join(lines)
 
-def build_chat_context(db: Session, user: User, latest_message: str) -> Tuple[str, Optional[str]]:
+def build_chat_context(db: Session, user: User, latest_message: str, structured_override: Optional[dict] = None) -> Tuple[str, Optional[str]]:
     """Build a safe context string for LLM calls with truncation.
 
     Returns (context_text, notice_if_truncated)
     """
     profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
     profile_str = _profile_lines(profile) 
-    # Latest lab report (structured)
-    lab = (
-        db.query(LabReport)
-        .filter(LabReport.user_id == str(user.id))
-        .order_by(LabReport.created_at.desc())
-        .first() 
-    )
-
-    lab_struct = lab.structured_json if (lab and lab.structured_json) else None
+    # Latest lab report (structured) — allow override from request context
+    if structured_override is not None:
+        lab_struct = structured_override
+    else:
+        lab = (
+            db.query(LabReport)
+            .filter(LabReport.user_id == str(user.id))
+            .order_by(LabReport.created_at.desc())
+            .first() 
+        )
+        lab_struct = lab.structured_json if (lab and lab.structured_json) else None
     lab_str = json.dumps(lab_struct, ensure_ascii=False, indent=2) if lab_struct else "None provided"
 
     # Latest symptom event (optional)

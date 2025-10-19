@@ -1,0 +1,6 @@
+from lab_parser import parse_lab_text
+text='''Ferritin 1270H.1 ng/mL [10-120]
+CholesterolTotal(mmol/L) 4.7. mmol/L [<=5.2]
+Triglyceride(mg/dL) 75. mg/dL [<=150]'''
+res = parse_lab_text(text)
+print(res['presentation'])

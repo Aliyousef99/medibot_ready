@@ -3,6 +3,14 @@ import axios from 'axios';
 export interface ChatResponseCombined {
   request_id: string;
   summary?: string;
+  user_view?: {
+    summary?: string;
+    abnormal?: Array<{ name?: string; value?: number | string; unit?: string; status?: string; ref_min?: number; ref_max?: number; reference?: any }>;
+    normal?: Array<{ name?: string; value?: number | string; unit?: string; status?: string; ref_min?: number; ref_max?: number; reference?: any }>;
+    recommendation?: string;
+    confidence?: number;
+    explanation?: string;
+  };
   symptom_analysis: {
     symptoms?: string[];
     possible_tests?: string[];
@@ -21,6 +29,10 @@ export interface ChatResponseCombined {
   disclaimer: string;
   pipeline?: any;
   missing_fields?: string[];
+  triage?: {
+    level: 'ok' | 'watch' | 'urgent' | string;
+    reasons?: string[];
+  };
 }
 
 export interface SymptomAnalysisResult {
@@ -87,10 +99,7 @@ export const updateProfile = async (profileData: any): Promise<any> => {
     return response.data;
 };
 
-export const analyzeSymptoms = async (symptoms: string): Promise<SymptomAnalysisResult> => {
-    const response = await api.post('/api/symptoms/analyze', { text: symptoms });
-    return response.data;
-};
+// Note: Symptom analysis is now fused into /api/chat results; no separate call needed.
 
 export const extractText = async (file: File): Promise<{ text: string }> => {
     const formData = new FormData();

@@ -244,6 +244,7 @@ app.include_router(recs_routes.router, prefix="/api/recommendations")
 class ParseRequest(BaseModel):
     text: constr(max_length=5000)
 
+
 class ChatIn(BaseModel):
     message: str
 
@@ -259,6 +260,7 @@ class ChatOut(BaseModel):
     pipeline: Optional[Dict[str, Any]] = None
     missing_fields: Optional[List[str]] = None
     triage: Optional[Dict[str, Any]] = None
+    user_view: Optional[Dict[str, Any]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -557,6 +559,17 @@ def parse_line_into_test(line: str, preferred_name: Optional[str] = None) -> Opt
         canon = "Cholesterol Total"
     elif canon_low.startswith("triglyceride"):
         canon = "Triglyceride"
+
+    # Drop legend/threshold headings like 'Desirable', 'Normal', 'Borderline High', 'High:>' etc.
+    try:
+        low_name = (canon or "").strip().lower()
+        if re.match(r"^(desirable|normal|borderline\s*high?|very\s*high|high:?|low:?)(\b|:|\s)", low_name):
+            return None
+        slug = re.sub(r"[^a-z0-9]+", "", low_name)
+        if slug in {"desirable", "normal", "borderline", "borderlinehigh", "veryhigh", "high", "low", "reference", "ref"}:
+            return None
+    except Exception:
+        pass
 
     # Confidence heuristic: base on row match (0.7), +unit (0.15), +ref (0.15)
     conf = 0.7 + (0.15 if unit else 0.0) + (0.15 if ref else 0.0)
@@ -928,48 +941,214 @@ async def chat(
     except Exception:
         pass
 
-    # If the incoming message looks like a lab report, parse and persist now
+    # Inline extractor: run early for pasted lab-like messages; do NOT write to DB
+    user_view: Optional[Dict[str, Any]] = None
     try:
-        maybe_lab = parse_lab_text(payload.message or "")
-        tests_now = (maybe_lab or {}).get("tests") if isinstance(maybe_lab, dict) else None
-        if isinstance(tests_now, list) and len(tests_now) > 0:
-            # Persist LabReport and cache for this user; make it the current context
+        raw_msg = (payload.message or "")
+        # Minimal pre-clean per spec
+        cleaned = (
+            raw_msg
+            .replace("&lt;=", "<=")
+            .replace("&gt;=", ">=")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+        )
+        # 1270H.1 -> 1270.1 H (record flag separately)
+        cleaned = re.sub(r"(?i)(\b\d+)([HL])\.(\d+\b)", r"\1.\3 \2", cleaned)
+        # Strip trailing dots after numbers: 4.7. -> 4.7
+        cleaned = re.sub(r"(\b\d+(?:\.\d+)?)(\.)\b", r"\1", cleaned)
+        # Normalize analyte names
+        cleaned = re.sub(r"\bCholesterolTotal\b", "Total Cholesterol", cleaned)
+        cleaned = re.sub(r"\bTriglyceride\b", "Triglycerides", cleaned)
+
+        # Trigger condition: long text AND contains unit token OR bracketed range
+        long_enough = len(cleaned) >= 200
+        has_unit = bool(re.search(r"(?i)\b(ng/mL|mmol/L|mg/dL)\b", cleaned))
+        has_brackets = ("[" in cleaned and "]" in cleaned)
+        if long_enough and (has_unit or has_brackets):
+            # Prefer dedicated inline parser if available
+            inline_result: Optional[Dict[str, Any]] = None
             try:
-                abnormal_count_now = sum(1 for t in tests_now if ((t or {}).get("abnormal") or (t or {}).get("status")) in ("high","low"))
-                names_now = [t.get("name") for t in tests_now if (isinstance(t, dict) and t.get("name"))][:3]
-                ts_now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-                title_now = f"{', '.join([n for n in names_now if n]) or 'Lab Report'} — {ts_now}"
-                lr_now = LabReport(
-                    user_id=str(user.id),
-                    title=title_now,
-                    raw_text=payload.message or "",
-                    structured_json=maybe_lab,
-                    summary=f"Parsed {len(tests_now)} analytes; {abnormal_count_now} abnormal.",
-                )
-                db.add(lr_now)
-                db.commit()
-                set_latest_lab_cache(str(user.id), maybe_lab)
-                try:
-                    request.state.structured_lab = maybe_lab
-                except Exception:
-                    pass
-                try:
-                    logger.info({
-                        "function": "lab_persist",
-                        "user_id": str(user.id),
-                        "lab_report_id": str(lr_now.id),
-                        "analyte_count": len(tests_now),
-                        "abnormal_count": abnormal_count_now,
-                    })
-                except Exception:
-                    pass
+                if '_inline_parse' in globals() and callable(globals().get('_inline_parse')):
+                    inline_fn = globals().get('_inline_parse')  # type: ignore
+                    from datetime import datetime as _dt
+                    now_iso = _dt.utcnow().isoformat() + "Z"
+                    inline_result = inline_fn(cleaned, received_at=now_iso)  # type: ignore[misc]
+                else:
+                    inline_result = None
             except Exception:
+                inline_result = None
+
+            presentation: Dict[str, Any] = {}
+            structured_json: Dict[str, Any] = {}
+            if isinstance(inline_result, dict) and inline_result.get("presentation"):
+                presentation = inline_result.get("presentation") or {}
+                structured_json = inline_result.get("structured_json") or {}
+            else:
+                # Fallback: use built-in heuristic parser
+                maybe_lab = parse_lab_text(cleaned)  # returns {tests:[...]}
+                tests_now = (maybe_lab or {}).get("tests") if isinstance(maybe_lab, dict) else []
+                abnormal_items = []
+                normal_items = []
+                for t in (tests_now or []):
+                    try:
+                        flag = (t.get("abnormal") or t.get("status") or "").lower()
+                        item = {
+                            "name": t.get("name"),
+                            "value": t.get("value"),
+                            "unit": t.get("unit"),
+                            "status": flag or "unspecified",
+                        }
+                        if flag in ("high", "low"):
+                            abnormal_items.append(item)
+                        else:
+                            normal_items.append(item)
+                    except Exception:
+                        continue
+                # simple confidence heuristic
+                parsed = len(tests_now or [])
                 try:
-                    db.rollback()
+                    line_count = max(1, len((cleaned or '').splitlines()))
+                except Exception:
+                    line_count = 1
+                confidence = round(min(0.95, max(0.2, (parsed / line_count) + 0.2)), 2) if tests_now else 0.4
+                presentation = {"abnormal": abnormal_items, "normal": normal_items, "confidence": confidence}
+                structured_json = {"analytes": tests_now or []}
+
+            parsed_n = len((structured_json.get("analytes") or [])) if isinstance(structured_json, dict) else 0
+            abnormal_n = len((presentation.get("abnormal") or [])) if isinstance(presentation, dict) else 0
+            conf = float(presentation.get("confidence") or 0.0) if isinstance(presentation, dict) else 0.0
+
+            # Build user_view for UI consumption when we have parsed lines
+            if parsed_n >= 1:
+                summary_txt = f"Parsed {parsed_n} line(s); {abnormal_n} abnormal."
+                # Append received date if present in the raw text as "ReceivedDate/Time dd/mm/yyyy"
+                try:
+                    m = re.search(r"(?i)received\s*date\s*/\s*time[^\n\r]*?(\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b)", cleaned)
+                    if m:
+                        summary_txt += f" ({m.group(1)})"
                 except Exception:
                     pass
+                # Build a concise, non-vague explanation with clear next steps
+                try:
+                    causes_map = {
+                        'ferritin': 'iron overload, significant inflammation, or liver disease',
+                        'ldl': 'increased cardiovascular risk',
+                        'hdl': 'reduced protective cholesterol',
+                        'triglycerides': 'metabolic factors such as insulin resistance or diet',
+                        'glucose': 'elevated blood sugar or diabetes risk',
+                        'hemoglobin': 'anemia (if low) or dehydration (if high)',
+                        'tsh': 'thyroid dysfunction',
+                        'crp': 'inflammation',
+                    }
+                    def _name_key(n: str) -> str:
+                        return (n or '').strip().lower().replace(' ', '')
+                    ab_names = []
+                    critical = False
+                    critical_names = []
+                    for it in (presentation.get('abnormal') or []):
+                        nm = str(it.get('name') or '').strip()
+                        st = (it.get('status') or '').lower()
+                        if not nm:
+                            continue
+                        # Detect critical by value vs ref_max when available
+                        try:
+                            v = float(str(it.get('value') or '').replace(',', ''))
+                        except Exception:
+                            v = None
+                        ref_max = it.get('ref_max')
+                        ref_min = it.get('ref_min')
+                        if ref_max is None and isinstance(it.get('reference'), dict) and it['reference'].get('kind') in ('lt','lte'):
+                            ref_max = it['reference'].get('v')
+                        try:
+                            if v is not None:
+                                if st == 'high' and ref_max is not None and float(ref_max) > 0:
+                                    ratio = v / float(ref_max)
+                                    if ratio >= 2.0:
+                                        critical = True
+                                        critical_names.append(nm)
+                                if st == 'low' and ref_min is not None and float(ref_min) > 0:
+                                    ratio_low = v / float(ref_min)
+                                    if ratio_low <= 0.5:
+                                        critical = True
+                                        critical_names.append(nm)
+                        except Exception:
+                            pass
+                        # Collect name + status label
+                        ab_names.append(f"{nm} ({'elevated' if st=='high' else 'low' if st=='low' else st or 'abnormal'})")
+                    ab_part = ", ".join(ab_names[:3]) if ab_names else ''
+                    # Choose analyte-specific cause if available
+                    cause_hint = None
+                    try:
+                        for it in (presentation.get('abnormal') or []):
+                            nm = str(it.get('name') or '')
+                            k = _name_key(nm)
+                            # normalize keys for common analytes
+                            if 'ferritin' in k:
+                                cause_hint = causes_map['ferritin']; break
+                            if k in ('ldl','hdl') or 'cholesterol' in k:
+                                cause_hint = causes_map['ldl']; break
+                            if 'triglycer' in k:
+                                cause_hint = causes_map['triglycerides']; break
+                            if 'glucose' in k:
+                                cause_hint = causes_map['glucose']; break
+                            if 'hemoglobin' in k or k=='hb':
+                                cause_hint = causes_map['hemoglobin']; break
+                            if 'tsh' in k:
+                                cause_hint = causes_map['tsh']; break
+                            if 'crp' in k:
+                                cause_hint = causes_map['crp']; break
+                    except Exception:
+                        pass
+                    if abnormal_n == 0:
+                        explanation_txt = 'Your results are within normal limits based on the ranges shown.'
+                    else:
+                        base = f"The following result(s) are abnormal: {ab_part}. " if ab_part else "Some results are abnormal. "
+                        if critical:
+                            more = "This is significantly outside the reference range"
+                            if cause_hint:
+                                more += f" and may indicate {cause_hint}"
+                            explanation_txt = base + more + ". Based on your available information, please seek immediate medical attention."
+                        else:
+                            more = "This may indicate an underlying issue"
+                            if cause_hint:
+                                more += f" such as {cause_hint}"
+                            explanation_txt = base + more + ". Please discuss these results with your clinician."
+                except Exception:
+                    explanation_txt = ''
+                if abnormal_n > 0:
+                    recommendation_txt = "Some results are outside reference. Please consider discussing with your clinician, especially if you have symptoms."
+                else:
+                    recommendation_txt = "Most results appear within range. Maintain healthy habits and follow your clinician's guidance."
+                user_view = {
+                    "summary": summary_txt,
+                    "abnormal": presentation.get("abnormal") or [],
+                    "normal": presentation.get("normal") or [],
+                    "recommendation": recommendation_txt,
+                    "confidence": round(conf, 2),
+                    "explanation": explanation_txt,
+                }
+
+            # Attach to request state for downstream context but DO NOT persist
+            try:
+                if structured_json:
+                    request.state.structured_lab = structured_json
+            except Exception:
+                pass
+
+            # Single info log as specified
+            try:
+                logger.info({
+                    "function": "inline_lab_extract",
+                    "parsed": parsed_n,
+                    "abnormal": abnormal_n,
+                    "confidence": round(conf, 2),
+                })
+            except Exception:
+                pass
     except Exception:
-        pass
+        # Inline extraction is best-effort; never block chat
+        user_view = None
 
     # Resolve latest structured lab: current -> cache -> db -> none
     # Helpers: safe JSON load and validation for structured lab objects
@@ -1450,7 +1629,8 @@ async def chat(
     prompt = (
         "You are a helpful medical assistant. Use the provided context to answer the user's question. "
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
-        "If context is missing, inform the user. Do not provide medical advice. "
+        "Provide general, educational information and you may answer follow-up questions about likely causes of abnormal tests (e.g., high ferritin) and typical next steps. "
+        "Avoid diagnosis or prescriptions; include caveats and when to seek care. "
         "Keep responses concise and easy to understand.\n\n"
         f"TRIAGE: {(triage or {}).get('level', 'low')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
         "\n--- Conversation History (most recent first) ---\n"
@@ -1586,6 +1766,7 @@ async def chat(
         pipeline={"symptom_parse": pipeline_json},
         missing_fields=missing_fields,
         triage=triage,
+        user_view=user_view,
     )
 
 
@@ -1772,6 +1953,67 @@ async def extract_text(request: Request, file: UploadFile = File(...), user: Use
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"OCR failed: {e}")
 
+# -------------------- Lightweight Inline Extractor (no DB, no ML) --------------------
+try:
+    from lab_parser import parse_lab_text as _inline_parse
+except Exception:
+    try:
+        from backend.services.lab_parser import parse_lab_text as _inline_parse  # type: ignore
+    except Exception:
+        _inline_parse = None  # type: ignore
+
+class InlineParseIn(BaseModel):
+    text: constr(max_length=10000)
+
+class InlineParseOut(BaseModel):
+    presentation: Dict[str, Any]
+    structured_json: Dict[str, Any]
+
+@app.post("/api/labs/inline_extract", response_model=InlineParseOut)
+@limiter.limit("60/minute", key_func=user_rate_key)
+async def inline_extract(request: Request, payload: InlineParseIn, user: User = Depends(get_current_user)):
+    # Record user id on request state for per-user rate limiting
+    try:
+        request.state.user_id = str(user.id)
+    except Exception:
+        pass
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if _inline_parse is None:
+        # Try dynamic import fallback if initial import failed
+        try:
+            from lab_parser import parse_lab_text as _dyn_inline
+            globals()["_inline_parse"] = _dyn_inline  # cache for subsequent calls
+        except Exception:
+            try:
+                from backend.services.lab_parser import parse_lab_text as _dyn_inline  # type: ignore
+                globals()["_inline_parse"] = _dyn_inline
+            except Exception:
+                raise HTTPException(status_code=500, detail="inline extractor unavailable")
+    from datetime import datetime as _dt
+    now_iso = _dt.utcnow().isoformat() + "Z"
+    try:
+        # _inline_parse may have been initialized at import time or via dynamic fallback above
+        parser_fn = globals().get("_inline_parse")
+        if not callable(parser_fn):
+            raise RuntimeError("inline extractor unavailable")
+        result = parser_fn(text, received_at=now_iso)  # type: ignore[misc]
+    except Exception as e:
+        logger.exception("inline_extract failed")
+        raise HTTPException(status_code=500, detail=f"parse failed: {e}")
+    pres = result.get("presentation") or {"abnormal": [], "normal": [], "confidence": 0.2}
+    try:
+        logger.info({
+            "function": "lab_parse_summary",
+            "parsed_count": len((result.get("structured_json") or {}).get("analytes", [])),
+            "abnormal_count": len(pres.get("abnormal", [])),
+            "overall_lab_confidence": pres.get("confidence", 0.2),
+        })
+    except Exception:
+        pass
+    return InlineParseOut(presentation=pres, structured_json=result.get("structured_json") or {"analytes": [], "received_at": now_iso})
+
 # -------------------- Table/line parser helpers (new) --------------------
 
 RANGE_BRACKET = re.compile(r"[\[](?P<body>[^\\\]]+)[\]]")  # [<=5.2], [10-120], [200-239mg/dL]
@@ -1781,10 +2023,12 @@ def clean_value_token(tok: str) -> str:
     """Strip trailing punctuation and glued flags like '1270H.1' -> '1270' and return numeric string."""
     t = tok.strip()
     # split glued H/L flags next to number (e.g., 1270H.1 or 1270H)
-    t = re.sub(r"(?i)\b(" + NUM + r")[HhLl](?:\\."+")?", r"\1", t)  # tolerate an extra dot after H/L
-    # remove trailing dots and commas
-    t = re.sub(r"[.,]+", "", t)
-    # keep only leading numeric
+    t = re.sub(r"(?i)\b(" + NUM + r")[HhLl](?:\.)?", r"\1", t)
+    # remove thousands separators, but keep decimal points
+    t = t.replace(",", "")
+    # strip only trailing periods after a numeric token (avoid removing decimal points)
+    t = re.sub(r"(?<=\d)\.(?=\s|$)", "", t)
+    # keep only leading numeric (with optional decimal)
     m = re.match(r"^\\s*(" + NUM + ")", t)
     return m.group(1) if m else ""
 
@@ -1808,6 +2052,8 @@ def parse_bracket_range(line: str) -> Optional[Dict[str, Any]]:
     if not m:
         return None
     body = m.group("body").replace(" ", "")
+    # normalize unicode dashes inside the range/threshold body
+    body = body.replace("\u2013", "-").replace("\u2014", "-")
     # <=, <, >=, >
     m2 = re.match(r"^(<=|<|>=|>)(" + NUM + r")([a-zA-Zµμ%/\\^-]+)?$", body)
     if m2:
