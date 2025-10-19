@@ -28,10 +28,12 @@ from backend.models import init_db, symptom_event # noqa - needed to register mo
 from backend.db.session import SessionLocal, get_db
 from backend.auth.deps import hash_password, get_current_user
 from backend.models.user import User, UserProfile
+from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
+from backend.services.recommendations import recommend
 from backend.routers.profile import router as profile_router
 
 # --- app & router setup ---
@@ -166,6 +168,7 @@ class ChatOut(BaseModel):
     response: str
     pipeline: Optional[Dict[str, Any]] = None
     symptom_analysis: Optional[Dict[str, Any]] = None
+    local_recommendations: Optional[Dict[str, Any]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -616,6 +619,52 @@ async def chat(
             symptom_analysis["event_id"] = ev_id
         except Exception:
             pass
+        try:
+            logger.info({
+                "function": "chat_symptom_analysis_saved",
+                "event_id": ev_id,
+                "symptoms": symptom_analysis.get("symptoms", []),
+                "tests": symptom_analysis.get("possible_tests", []),
+                "confidence": symptom_analysis.get("confidence", 0.0),
+            })
+        except Exception:
+            pass
+
+    # Build local recommendations block using profile + latest lab + reported symptoms
+    local_recs: Dict[str, Any] = {}
+    try:
+        prof = db.query(UserProfile).filter(UserProfile.user_id == str(user.id)).first()
+        profile_dict = None
+        if prof is not None:
+            try:
+                profile_dict = {
+                    "age": getattr(prof, "age", None),
+                    "sex": getattr(prof, "sex", None),
+                    "conditions": list(getattr(prof, "conditions", []) or []),
+                    "medications": list(getattr(prof, "medications", []) or []),
+                }
+            except Exception:
+                profile_dict = None
+
+        lab = (
+            db.query(LabReport)
+            .filter(LabReport.user_id == str(user.id))
+            .order_by(LabReport.created_at.desc())
+            .first()
+        )
+        latest_lab_struct = lab.structured_json if (lab and lab.structured_json) else None
+
+        local_recs = recommend(profile_dict, latest_lab_struct, symptom_analysis.get("symptoms", []))
+        try:
+            logger.info({
+                "function": "recommend",
+                "priority": local_recs.get("priority"),
+                "actions_count": len(local_recs.get("actions", []) or []),
+            })
+        except Exception:
+            pass
+    except Exception:
+        local_recs = {}
 
     context, notice = build_chat_context(db, user, payload.message)
     prompt = (
@@ -633,10 +682,10 @@ async def chat(
 
     if pipeline_json.get("overall_confidence", 0.0) >= 0.5:
         # Avoid Gemini; return structured parse
-        return ChatOut(response="Structured symptom analysis detected.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis)
+        return ChatOut(response="Structured symptom analysis detected.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis, local_recommendations=local_recs)
 
     if not GEMINI_API_KEY:
-        return ChatOut(response="Chat is not configured. No API key found.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis)
+        return ChatOut(response="Chat is not configured. No API key found.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis, local_recommendations=local_recs)
 
     try:
         async with httpx.AsyncClient(timeout=25) as client:
@@ -650,7 +699,7 @@ async def chat(
             r.raise_for_status()
             data = r.json()
             text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "") or "Could not generate a response."
-            return ChatOut(response=text.strip(), symptom_analysis=symptom_analysis)
+            return ChatOut(response=text.strip(), symptom_analysis=symptom_analysis, local_recommendations=local_recs)
     except Exception as e:
         logger.exception("Chat endpoint failed")
         raise HTTPException(status_code=500, detail=f"Could not get a response from the chat model: {e}")
