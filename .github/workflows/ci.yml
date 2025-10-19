@@ -7,16 +7,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}   # 👈 makes `import backend` work
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Show requirements file used in CI
+        run: |
+          echo "=== backend/requirements.txt ==="
+          nl -ba backend/requirements.txt
+
       - name: Install backend deps
         run: |
           python -m pip install --upgrade pip
-          # Install only backend requirements using the same interpreter
           python -m pip install -r backend/requirements.txt
-      - name: Run tests
+
+      - name: Sanity import
         run: |
-          pytest
+          python -c "import sqlalchemy; print('SQLAlchemy', sqlalchemy.__version__)"
+          python -c "import backend, sys; print('import backend -> OK')"
+
+      - name: Run tests
+        run: pytest
