@@ -4,10 +4,10 @@ from typing import Optional, List, Dict, Tuple
 RED_FLAG_KEYWORDS: List[Tuple[str, List[str]]] = [
     # canonical reason, variants
     ("syncope", [
-        "fainted", "fainting", "syncope", "passed out", "pass out", "black out", "blacked out"
+        "fainted", "fainting", "syncope", "passed out", "pass out", "black out", "blacked out", "blackout", "lost consciousness", "collapsed"
     ]),
     ("chest pain", [
-        "chest pain", "pressure in chest", "tightness in chest"
+        "chest pain", "pressure in chest", "tightness in chest", "chest tightness"
     ]),
     ("shortness of breath", [
         "shortness of breath", "trouble breathing", "difficulty breathing", "breathless", "sob"
@@ -23,6 +23,15 @@ RED_FLAG_KEYWORDS: List[Tuple[str, List[str]]] = [
     ]),
     ("uncontrolled bleeding", [
         "uncontrolled bleeding", "heavy bleeding", "bleeding that won't stop", "bleeding won't stop"
+    ]),
+    ("gi bleeding", [
+        "blood in stool", "bloody stool", "blood in my stool", "blood in vomit", "bloody vomit", "hematemesis", "melena"
+    ]),
+    ("vision loss", [
+        "vision loss", "lost vision", "sudden vision loss", "can't see", "cannot see", "blindness in one eye", "amaurosis", "vision went dark"
+    ]),
+    ("severe neck pain", [
+        "new severe neck pain", "severe neck pain", "sudden neck pain"
     ]),
 ]
 

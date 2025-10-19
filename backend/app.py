@@ -107,6 +107,53 @@ except Exception:
             return None
     limiter = _NoopLimiter()
     app.state.limiter = limiter
+    # Provide fallback get_remote_address to keep code paths working without slowapi
+    def get_remote_address(request):  # type: ignore[no-redef]
+        try:
+            c = getattr(request, 'client', None)
+            return getattr(c, 'host', 'unknown') or 'unknown'
+        except Exception:
+            return 'unknown'
+
+# ---- Rate limit helpers & handler ----
+import time
+from fastapi import Request as _FastAPIRequest
+
+def user_rate_key(request: _FastAPIRequest) -> str:
+    """Return a per-user key when available; otherwise fall back to IP.
+
+    Assumes a dependency sets request.state.user_id for authenticated routes.
+    """
+    try:
+        uid = getattr(request.state, "user_id", None)
+        if uid:
+            return str(uid)
+    except Exception:
+        pass
+    return get_remote_address(request)
+
+if 'RateLimitExceeded' in globals():
+    @app.exception_handler(RateLimitExceeded)
+    async def rate_limit_handler(request: _FastAPIRequest, exc: RateLimitExceeded):
+        try:
+            retry_after = max(1, int(getattr(exc, "reset_time", time.time()) - time.time()))
+        except Exception:
+            retry_after = 60
+        try:
+            logger.info({
+                "function": "rate_limit",
+                "path": str(request.url.path),
+                "client": get_remote_address(request),
+            })
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "detail": "Too many requests. Please wait a bit and try again.",
+            },
+        )
 
 
 def _maybe_seed_demo_user() -> None:
@@ -256,6 +303,30 @@ def detect_conditions(text: str) -> List[str]:
     return sorted(list(set(found)))
 
 def parse_lab_text(text: str) -> Dict[str, Any]:
+    # Pre-normalize noisy OCR/HTML text before any extraction
+    def _normalize_ocr_text(s: str) -> str:
+        try:
+            # HTML entities and angle variants
+            s = s.replace("&lt;=", "<=").replace("&gt;=", ">=")
+            s = s.replace("&lt;", "<").replace("&gt;", ">")
+            s = s.replace("&amp;", "&")
+            # Fix tokens like 1270H.1 -> 1270.1 H (preserve H/L semantics explicitly)
+            s = re.sub(r"(?i)(\b\d+)([HL])\.(\d+\b)", r"\1.\3 \2", s)
+            # Collapse stray trailing periods on numeric tokens: 4.7. -> 4.7, 181. -> 181
+            s = re.sub(r"(\b\d+(?:\.\d+)?)(\.)\b", r"\1", s)
+            # Normalize whitespace
+            s = re.sub(r"[\t\r]+", " ", s)
+            s = re.sub(r"\u00A0", " ", s)  # non-breaking space
+            # Normalize line endings and trim excessive internal spaces
+            lines = []
+            for ln in s.splitlines():
+                lines.append(re.sub(r"\s+", " ", ln).strip())
+            return "\n".join(ln for ln in lines if ln)
+        except Exception:
+            return s
+
+    original_text = text
+    text = _normalize_ocr_text(text)
     pipeline, model_name, init_warning = get_ner_pipeline()
     entities_raw: List[Dict[str, Any]] = []
     entities_formatted: List[Dict[str, Any]] = []
@@ -287,12 +358,30 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
         if not meta.get("engine"):
             meta["engine"] = "heuristic-fallback"
 
-        return {
+        # Compute a quick overall confidence for labs parsed via heuristics
+        try:
+            confs = [t.get("confidence", 0.5) for t in heuristics_data.get("tests", []) if t.get("unit") or t.get("ref_min") or t.get("ref_max")]
+            overall_conf = round(sum(confs)/max(1, len(confs)), 2)
+        except Exception:
+            overall_conf = 0.5
+
+        out = {
             "tests": heuristics_data["tests"],
             "conditions": heuristics_data["conditions"],
             "entities": entities_formatted,
-            "meta": meta,
+            "meta": {**meta, "overall_lab_confidence": overall_conf, "cleaned_text": text},
         }
+        try:
+            abnormal_count = sum(1 for t in heuristics_data.get("tests", []) if t.get("abnormal") in ("high", "low"))
+            logger.info({
+                "function": "lab_parse_summary",
+                "parsed_count": len(heuristics_data.get("tests", [])),
+                "abnormal_count": abnormal_count,
+                "overall_lab_confidence": overall_conf,
+            })
+        except Exception:
+            pass
+        return out
 
     conditions = detect_conditions(text)
     engine = "huggingface-biobert"
@@ -331,12 +420,30 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
         combined = sorted(set(conditions) | set(heuristic_conditions))
         conditions = combined
 
-    return {
+    # Compute a quick overall confidence for labs parsed via NER+heuristics tests
+    try:
+        confs = [t.get("confidence", 0.5) for t in tests if t.get("unit") or t.get("ref_min") or t.get("ref_max")]
+        overall_conf = round(sum(confs)/max(1, len(confs)), 2)
+    except Exception:
+        overall_conf = 0.5
+
+    out = {
         "tests": tests,
         "conditions": conditions,
         "entities": entities_formatted,
-        "meta": meta,
+        "meta": {**meta, "overall_lab_confidence": overall_conf, "cleaned_text": text},
     }
+    try:
+        abnormal_count = sum(1 for t in tests if t.get("abnormal") in ("high", "low"))
+        logger.info({
+            "function": "lab_parse_summary",
+            "parsed_count": len(tests),
+            "abnormal_count": abnormal_count,
+            "overall_lab_confidence": overall_conf,
+        })
+    except Exception:
+        pass
+    return out
 # -------------------- Routes --------------------
 
 def get_ner_pipeline():
@@ -382,6 +489,13 @@ def parse_line_into_test(line: str, preferred_name: Optional[str] = None) -> Opt
         name = mnu.group("name").strip()
         name_unit = normalize_unit_text(mnu.group("unit").strip())
 
+    # Inline abnormal flags (H/L) may be glued to values; detect before cleaning
+    inline_flag = None
+    if re.search(r"(?i)\d+[H](?:\.|\b)", valtok):
+        inline_flag = "high"
+    elif re.search(r"(?i)\d+[L](?:\.|\b)", valtok):
+        inline_flag = "low"
+
     value_str = clean_value_token(valtok).replace(",", "")
     if not value_str:
         return None
@@ -391,7 +505,7 @@ def parse_line_into_test(line: str, preferred_name: Optional[str] = None) -> Opt
         return None
 
     unit = normalize_unit_text(unit_tok) or name_unit or ""
-    status = detect_flag(valtok) or detect_status(rest) or "unspecified"
+    status = inline_flag or detect_flag(valtok) or detect_status(rest) or "unspecified"
 
     ref = parse_bracket_range(raw)
     if ref:
@@ -408,13 +522,42 @@ def parse_line_into_test(line: str, preferred_name: Optional[str] = None) -> Opt
     elif canon_low.startswith("triglyceride"):
         canon = "Triglyceride"
 
-    return {
+    # Confidence heuristic: base on row match (0.7), +unit (0.15), +ref (0.15)
+    conf = 0.7 + (0.15 if unit else 0.0) + (0.15 if ref else 0.0)
+    conf = max(0.0, min(1.0, conf))
+
+    # Normalize reference dict to ref_min/ref_max
+    ref_min: Optional[float] = None
+    ref_max: Optional[float] = None
+    if ref:
+        try:
+            kind = ref.get("kind")
+            if kind == "between":
+                ref_min = float(ref.get("lo")) if ref.get("lo") is not None else None
+                ref_max = float(ref.get("hi")) if ref.get("hi") is not None else None
+            elif kind in ("lt", "lte"):
+                ref_max = float(ref.get("v")) if ref.get("v") is not None else None
+            elif kind in ("gt", "gte"):
+                ref_min = float(ref.get("v")) if ref.get("v") is not None else None
+        except Exception:
+            ref_min = ref_min or None
+            ref_max = ref_max or None
+
+    abnormal = status if status in ("high", "low", "normal") else "unknown"
+
+    result = {
         "name": canon,
         "value": value_str,
         "unit": unit,
         "status": status,
         "reference": ref or None,
+        "ref_min": ref_min,
+        "ref_max": ref_max,
+        "abnormal": abnormal,
+        "evidence": raw,
+        "confidence": round(conf, 2),
     }
+    return result
 
 def _keyword_pattern_fallback(text: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -431,12 +574,19 @@ def _keyword_pattern_fallback(text: str) -> List[Dict[str, Any]]:
             start, end = match.span()
             window = lowered_n[max(0, start - 30): min(len(lowered_n), end + 30)]
             status = detect_status(window) or "unspecified"
+            # Confidence lower for keyword fallback
+            conf = 0.5 + (0.2 if unit else 0.0)
             results.append({
                 "name": name,
                 "value": value,
                 "unit": unit,
                 "status": status,
                 "reference": None,
+                "ref_min": None,
+                "ref_max": None,
+                "abnormal": status if status in ("high","low","normal") else "unknown",
+                "evidence": text[start:end],
+                "confidence": round(min(conf, 1.0), 2),
             })
     return results
 
@@ -462,12 +612,71 @@ def _parse_lab_text_heuristic(text: str) -> Dict[str, Any]:
 
     conditions = detect_conditions(text)
 
+    # Post-process for unit/value mapping for common analytes
+    def add_display_values(t: Dict[str, Any]) -> Dict[str, Any]:
+        analyte = (t.get("name") or "").lower()
+        unit = t.get("unit") or ""
+        try:
+            val = float(str(t.get("value") or "").replace(",",""))
+        except Exception:
+            return t
+        display = {}
+        # mg/dL <-> mmol/L mapping for common analytes
+        CHOL_FACT = 38.67
+        TRIG_FACT = 88.57
+        GLUC_FACT = 18.0
+        def add_pair(mgdl: float, mmol: float):
+            display["mg/dL"] = round(mgdl, 2)
+            display["mmol/L"] = round(mmol, 2)
+        if "cholesterol" in analyte or analyte in ("ldl","hdl"):
+            if unit.lower() == "mg/dl":
+                add_pair(val, val/CHOL_FACT)
+            elif unit.lower() in ("mmol/l","mmol/L"):
+                add_pair(val*CHOL_FACT, val)
+        elif "triglyceride" in analyte:
+            if unit.lower() == "mg/dl":
+                add_pair(val, val/TRIG_FACT)
+            elif unit.lower() in ("mmol/l","mmol/L"):
+                add_pair(val*TRIG_FACT, val)
+        elif "glucose" in analyte:
+            if unit.lower() == "mg/dl":
+                add_pair(val, val/GLUC_FACT)
+            elif unit.lower() in ("mmol/l","mmol/L"):
+                add_pair(val*GLUC_FACT, val)
+        if display:
+            t["display_values"] = display
+        # Ensure numeric value
+        t["value"] = val
+        # Ensure abnormal from ref if unknown
+        if t.get("abnormal") in (None, "unknown"):
+            try:
+                if t.get("ref_min") is not None and val < float(t["ref_min"]):
+                    t["abnormal"] = "low"
+                elif t.get("ref_max") is not None and val > float(t["ref_max"]):
+                    t["abnormal"] = "high"
+                else:
+                    if t.get("ref_min") is not None or t.get("ref_max") is not None:
+                        t["abnormal"] = "normal"
+            except Exception:
+                pass
+        return t
+
+    tests = [add_display_values(t) for t in tests]
+
+    # Confidence aggregate
+    try:
+        confs = [t.get("confidence", 0.5) for t in tests if (t.get("unit") or t.get("ref_min") is not None or t.get("ref_max") is not None)]
+        overall = round(sum(confs)/max(1, len(confs)), 2)
+    except Exception:
+        overall = 0.5
+
     return {
         "tests": tests,
         "conditions": conditions,
         "meta": {
             "engine": "heuristic-fallback",
             "note": "BioBERT parsing unavailable; using keyword/row heuristics.",
+            "overall_lab_confidence": overall,
         },
     }
 
@@ -580,13 +789,19 @@ async def list_models(request: Request):
             raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
 
 @app.post("/api/chat", response_model=ChatOut)
-@limiter.limit("15/minute")
+@limiter.limit("30/minute", key_func=user_rate_key)
+@limiter.limit("100/minute", key_func=get_remote_address)
 async def chat(
     request: Request,
     payload: ChatIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ChatOut:
+    # Record user id on request state for per-user rate limiting
+    try:
+        request.state.user_id = str(user.id)
+    except Exception:
+        pass
     from backend.utils.app import build_chat_context
     from backend.services import symptoms as symp
 
@@ -906,8 +1121,13 @@ MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "10"))
 
 
 @app.post("/api/extract_text")
-@limiter.limit("2/minute")
-async def extract_text(request: Request, file: UploadFile = File(...)):
+@limiter.limit("10/minute", key_func=user_rate_key)
+async def extract_text(request: Request, file: UploadFile = File(...), user: User = Depends(get_current_user)):
+    # Record user id on request state for per-user rate limiting
+    try:
+        request.state.user_id = str(user.id)
+    except Exception:
+        pass
     # Read into memory; never write to disk
     data = await file.read()
     size_mb = len(data) / (1024 * 1024)
