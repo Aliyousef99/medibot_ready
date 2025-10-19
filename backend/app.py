@@ -85,6 +85,8 @@ try:
 
     limiter = Limiter(key_func=get_remote_address, default_limits=[])
     app.state.limiter = limiter
+
+    app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(SlowAPIMiddleware)
 
     # Provide a reset hook for tests
@@ -118,6 +120,38 @@ except Exception:
 # ---- Rate limit helpers & handler ----
 import time
 from fastapi import Request as _FastAPIRequest
+
+# ---- Simple latest-lab cache (TTL 15 min) ----
+if not hasattr(app.state, "latest_lab_cache"):
+    app.state.latest_lab_cache = {}  # type: ignore[attr-defined]
+
+LAB_CACHE_TTL_SECONDS = 15 * 60
+
+def set_latest_lab_cache(user_id: str, structured: Dict[str, Any]) -> None:
+    try:
+        app.state.latest_lab_cache[user_id] = {  # type: ignore[attr-defined]
+            "ts": time.time(),
+            "data": structured,
+        }
+    except Exception:
+        pass
+
+def get_latest_lab_cache(user_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        entry = app.state.latest_lab_cache.get(user_id)  # type: ignore[attr-defined]
+        if not entry:
+            return None
+        if time.time() - float(entry.get("ts", 0)) > LAB_CACHE_TTL_SECONDS:
+            # expired
+            try:
+                del app.state.latest_lab_cache[user_id]  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return None
+        data = entry.get("data")
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 def user_rate_key(request: _FastAPIRequest) -> str:
     """Return a per-user key when available; otherwise fall back to IP.
@@ -713,7 +747,7 @@ def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db)
 
         data = parse_lab_text(text)
 
-        # Persist structured lab for current user
+        # Persist structured lab for current user (UPSERT-lite) and cache
         try:
             tests = data.get("tests") or []
             analyte_names = [t.get("name") for t in tests if t.get("name")][:3]
@@ -722,22 +756,31 @@ def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db)
             ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
             title = f"{title_suffix} — {ts}"
             summary = f"Parsed {len(tests)} analytes; {abnormal_count} abnormal."
-            lr = LabReport(
-                user_id=str(user.id),
-                title=title,
-                raw_text=text,
-                structured_json=data,
-                summary=summary,
+            # simple dedupe: if last lab for user has identical structured_json, reuse it
+            lr = (
+                db.query(LabReport)
+                .filter(LabReport.user_id == str(user.id))
+                .order_by(LabReport.created_at.desc())
+                .first()
             )
-            db.add(lr)
-            db.commit()
+            if not lr or (lr.structured_json or {}) != data:
+                lr = LabReport(
+                    user_id=str(user.id),
+                    title=title,
+                    raw_text=text,
+                    structured_json=data,
+                    summary=summary,
+                )
+                db.add(lr)
+                db.commit()
+            # cache the structured lab for quick reuse in /api/chat
+            set_latest_lab_cache(str(user.id), data)
             try:
                 logger.info({
-                    "function": "lab_saved",
-                    "request_id": getattr(request, "request_id", None),
+                    "function": "lab_persist",
+                    "user_id": str(user.id),
                     "analyte_count": len(tests),
                     "abnormal_count": abnormal_count,
-                    "lab_id": str(lr.id),
                 })
             except Exception:
                 pass
@@ -852,8 +895,8 @@ async def chat(
     latest_lab_struct_early: Optional[Dict[str, Any]] = None
     lab_source = "none"
     try:
-        # If you later add an app-level cache, consult it here
-        cached = None
+        # Cache first
+        cached = get_latest_lab_cache(str(user.id))
         if cached and isinstance(cached, dict):
             latest_lab_struct_early = cached
             lab_source = "cache"
@@ -1212,7 +1255,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
         txt = ("Here's a brief summary of your labs.\n\n" +
                "\n".join(lines) +
                "\n\nThis is educational only; please consult a clinician.")
-        # Persist a LabReport with structured and summary
+        # Persist a LabReport with structured and summary; update cache
         try:
             tests = structured.get("tests") or []
             abnormal_count = sum(1 for t in tests if (t.get("abnormal") or t.get("status")) in ("high","low"))
@@ -1228,6 +1271,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
             )
             db.add(lr)
             db.commit()
+            set_latest_lab_cache(str(user.id), structured)
             if response is not None:
                 try:
                     response.headers["X-Lab-Id"] = str(lr.id)
@@ -1235,10 +1279,10 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                     pass
             try:
                 logger.info({
-                    "function": "lab_saved",
+                    "function": "lab_persist",
+                    "user_id": str(user.id),
                     "analyte_count": len(tests),
                     "abnormal_count": abnormal_count,
-                    "lab_id": str(lr.id),
                 })
             except Exception:
                 pass
@@ -1276,7 +1320,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
             ) or "I couldn’t generate a response."
             try:
                 final = text.strip()
-                # Persist LabReport for structured
+                # Persist LabReport for structured; update cache
                 tests = structured.get("tests") or []
                 abnormal_count = sum(1 for t in tests if (t.get("abnormal") or t.get("status")) in ("high","low"))
                 names = [t.get("name") for t in tests if t.get("name")][:3]
@@ -1291,6 +1335,7 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                 )
                 db.add(lr)
                 db.commit()
+                set_latest_lab_cache(str(user.id), structured)
                 if response is not None:
                     try:
                         response.headers["X-Lab-Id"] = str(lr.id)
@@ -1298,10 +1343,10 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
                         pass
                 try:
                     logger.info({
-                        "function": "lab_saved",
+                        "function": "lab_persist",
+                        "user_id": str(user.id),
                         "analyte_count": len(tests),
                         "abnormal_count": abnormal_count,
-                        "lab_id": str(lr.id),
                     })
                 except Exception:
                     pass
