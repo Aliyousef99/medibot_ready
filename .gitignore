@@ -1,24 +1,22 @@
-﻿# Node
-node_modules/
-.vite/
-dist/
-.env
-.env.local
-*.log
-
+﻿# Add common ignores (if you already have .gitignore, just append the lines)
+@"
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.db
+*.py[cod]
+*.egg-info/
+.dist/
+build/
+dist/
 
-# OS
+# Virtual envs
+.venv/
+venv/
+env/
+backend/.venv/
+
+# OS / IDE
 .DS_Store
 Thumbs.db
-
-# Build artifacts
-*.zip
-*.exe
-*.dll
-*.sqlite3
+.idea/
+.vscode/
+"@ | Out-File -Encoding utf8 .gitignore -Append
