@@ -10,6 +10,7 @@ from backend.auth.deps import get_current_user
 from backend.schemas.symptoms import (
     SymptomAnalysisRequest,
     SymptomAnalysisResult,
+    SymptomParseResult,
 )
 from backend.schemas.profile import UserProfileOut
 from backend.services import symptoms as symptoms_service
@@ -50,3 +51,14 @@ def analyze_symptoms(
 
     return SymptomAnalysisResult(**analysis_result)
 
+
+@router.post("/parse", response_model=SymptomParseResult, status_code=status.HTTP_200_OK)
+def parse_symptoms(
+    payload: SymptomAnalysisRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deterministic lexicon-based parse that returns structured JSON and confidence."""
+    result = symptoms_service.summarize_to_json(payload.text)
+    # Do not persist here; analyze path persists SymptomEvent records
+    return result

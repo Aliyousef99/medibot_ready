@@ -28,7 +28,10 @@ from backend.models import init_db, symptom_event # noqa - needed to register mo
 from backend.db.session import SessionLocal, get_db
 from backend.auth.deps import hash_password, get_current_user
 from backend.models.user import User, UserProfile
+from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
+from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
+from backend.services.symptom_events import save_symptom_event
 from backend.routers.profile import router as profile_router
 
 # --- app & router setup ---
@@ -149,6 +152,7 @@ app.add_middleware(
 app.include_router(auth_routes.router)
 app.include_router(history_routes.router)
 app.include_router(profile_router)   # profile PUT/GET live here
+app.include_router(symptoms_routes.router)
 app.include_router(recs_routes.router, prefix="/api/recommendations")
 
 # --- schemas ---
@@ -160,6 +164,8 @@ class ChatIn(BaseModel):
 
 class ChatOut(BaseModel):
     response: str
+    pipeline: Optional[Dict[str, Any]] = None
+    symptom_analysis: Optional[Dict[str, Any]] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -501,6 +507,52 @@ def parse_lab(req: ParseRequest):
             },
         }
 
+
+@app.post("/api/analyze_symptoms")
+@limiter.limit("20/minute")
+async def analyze_symptoms_ep(
+    request: Request,
+    payload: ParseRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Extract symptom entities and suggest likely tests.
+
+    Accepts: {"text": "I feel dizzy and weak"}
+    Returns: {"symptoms": ["dizziness", "weakness"], "possible_tests": ["blood sugar (glucose)", "hemoglobin (CBC)"], "confidence": 0.xx}
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        result = analyze_symptom_text(text)
+        # required logging format
+        try:
+            logger.info({
+                "function": "analyze_text",
+                "symptoms": result.get("symptoms", []),
+                "tests": result.get("possible_tests", []),
+                "confidence": result.get("confidence", 0.0),
+            })
+        except Exception:
+            pass
+
+        event = SymptomEvent(
+            user_id=str(user.id),
+            raw_text=text,
+            result_json=result,
+        )
+        db.add(event)
+        db.commit()
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.exception("/api/analyze_symptoms failed")
+        raise HTTPException(status_code=500, detail=f"analysis failed: {e}")
+
 @app.get("/api/list_models")
 @limiter.limit("5/minute")
 async def list_models(request: Request):
@@ -525,6 +577,45 @@ async def chat(
     user: User = Depends(get_current_user),
 ) -> ChatOut:
     from backend.utils.app import build_chat_context
+    from backend.services import symptoms as symp
+
+    # Run deterministic symptom parsing first
+    try:
+        pipeline_json = symp.summarize_to_json(payload.message).model_dump()
+    except Exception as _e:
+        pipeline_json = {"symptoms": [], "overall_confidence": 0.0}
+
+    # Run symptom analysis ONCE; do not persist here
+    try:
+        symptom_analysis = analyze_symptom_text(payload.message)
+        try:
+            logger.info({
+                "function": "analyze_text",
+                "symptoms": symptom_analysis.get("symptoms", []),
+                "tests": symptom_analysis.get("possible_tests", []),
+                "confidence": symptom_analysis.get("confidence", 0.0),
+            })
+        except Exception:
+            pass
+    except Exception:
+        symptom_analysis = {"symptoms": [], "possible_tests": [], "confidence": 0.0}
+
+    # Persist (idempotent within 10s) and attach event_id; do not duplicate across retries
+    ev_id: Optional[str] = None
+    try:
+        ev = save_symptom_event(db, str(user.id), payload.message, symptom_analysis)
+        ev_id = str(ev.id)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("save_symptom_event failed in /api/chat")
+    if ev_id:
+        try:
+            symptom_analysis["event_id"] = ev_id
+        except Exception:
+            pass
 
     context, notice = build_chat_context(db, user, payload.message)
     prompt = (
@@ -532,11 +623,20 @@ async def chat(
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "If context is missing, inform the user. Do not provide medical advice. "
         "Keep responses concise and easy to understand.\n\n"
-        f"{context}"
+        f"{context}\n\n--- Symptom Parser JSON (low confidence may be noisy) ---\n"
+        f"{json.dumps(pipeline_json, ensure_ascii=False)}\n\n"
+        "--- Extracted Symptom Entities ---\n"
+        f"{', '.join(symptom_analysis.get('symptoms') or []) or 'none'}\n"
+        "--- Suggested Tests From Symptoms ---\n"
+        f"{', '.join(symptom_analysis.get('possible_tests') or []) or 'none'}\n"
     )
 
+    if pipeline_json.get("overall_confidence", 0.0) >= 0.5:
+        # Avoid Gemini; return structured parse
+        return ChatOut(response="Structured symptom analysis detected.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis)
+
     if not GEMINI_API_KEY:
-        return ChatOut(response="Chat is not configured. No API key found.")
+        return ChatOut(response="Chat is not configured. No API key found.", pipeline={"symptom_parse": pipeline_json}, symptom_analysis=symptom_analysis)
 
     try:
         async with httpx.AsyncClient(timeout=25) as client:
@@ -550,7 +650,7 @@ async def chat(
             r.raise_for_status()
             data = r.json()
             text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "") or "Could not generate a response."
-            return ChatOut(response=text.strip())
+            return ChatOut(response=text.strip(), symptom_analysis=symptom_analysis)
     except Exception as e:
         logger.exception("Chat endpoint failed")
         raise HTTPException(status_code=500, detail=f"Could not get a response from the chat model: {e}")

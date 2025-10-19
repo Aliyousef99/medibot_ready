@@ -1,0 +1,20 @@
+{
+  "symptoms": [
+    { "canonical": "headache", "variants": ["headache", "head pain", "migraine"] },
+    { "canonical": "fever", "variants": ["fever", "febrile", "temperature"] },
+    { "canonical": "nausea", "variants": ["nausea", "queasy"] },
+    { "canonical": "cough", "variants": ["cough", "coughing"] },
+    { "canonical": "chest pain", "variants": ["chest pain", "chest discomfort"] },
+    { "canonical": "shortness of breath", "variants": ["shortness of breath", "sob", "difficulty breathing", "breathless"] },
+    { "canonical": "dizziness", "variants": ["dizzy", "dizziness", "lightheaded"] },
+    { "canonical": "fatigue", "variants": ["tired", "fatigue", "fatigued", "exhausted"] },
+    { "canonical": "sore throat", "variants": ["sore throat", "throat pain"] },
+    { "canonical": "abdominal pain", "variants": ["abdominal pain", "stomach ache", "stomach pain", "belly pain"] },
+    { "canonical": "diarrhea", "variants": ["diarrhea", "loose stools"] },
+    { "canonical": "vomiting", "variants": ["vomit", "vomiting", "threw up", "throwing up"] },
+    { "canonical": "back pain", "variants": ["back pain", "low back pain", "upper back pain"] },
+    { "canonical": "joint pain", "variants": ["joint pain", "arthralgia"] },
+    { "canonical": "rash", "variants": ["rash", "skin rash", "hives"] }
+  ]
+}
+

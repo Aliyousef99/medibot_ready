@@ -1,6 +1,6 @@
 # backend/schemas/symptoms.py
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 
 class SymptomSpan(BaseModel):
@@ -27,3 +27,18 @@ class SymptomAnalysisResult(BaseModel):
     urgency: str = Field(..., description="Urgency classification (e.g., 'normal', 'urgent').")
     summary: str = Field(..., description="A brief summary of the analysis.")
     engine: str = Field(..., description="The NER engine used for analysis.")
+
+
+class SymptomParsedItem(BaseModel):
+    name: str
+    canonical: str
+    negated: bool = False
+    onset: Optional[str] = None
+    duration: Optional[str] = None
+    severity: Optional[str] = None
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class SymptomParseResult(BaseModel):
+    symptoms: List[SymptomParsedItem]
+    overall_confidence: float = Field(0.0, ge=0.0, le=1.0)
