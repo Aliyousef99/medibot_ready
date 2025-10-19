@@ -971,35 +971,116 @@ async def chat(
         pass
 
     # Resolve latest structured lab: current -> cache -> db -> none
+    # Helpers: safe JSON load and validation for structured lab objects
+    def _deserialize_structured(obj: Any) -> Optional[Dict[str, Any]]:
+        try:
+            if obj is None:
+                return None
+            # Skip empty string or empty object strings
+            if isinstance(obj, str):
+                s = obj.strip()
+                if not s or s in ("{}", "null", "NULL", "None"):
+                    return None
+                try:
+                    loaded = json.loads(s)
+                except json.JSONDecodeError:
+                    return None
+                return loaded if isinstance(loaded, dict) and loaded else None
+            if isinstance(obj, dict):
+                return obj if obj else None
+            return None
+        except Exception:
+            return None
+
+    def _extract_analytes_and_abnormal(structured: Optional[Dict[str, Any]]) -> Tuple[List[str], int]:
+        names: List[str] = []
+        abnormal = 0
+        if not isinstance(structured, dict):
+            return names, abnormal
+        # Primary expected shape: { tests: [{name, abnormal/status, ...}, ...] }
+        tests = structured.get("tests")
+        if isinstance(tests, list):
+            for t in tests:
+                if not isinstance(t, dict):
+                    continue
+                nm = t.get("name")
+                if isinstance(nm, str) and nm and nm not in names:
+                    names.append(nm)
+                flag = (t.get("abnormal") or t.get("status") or "")
+                if isinstance(flag, str) and flag.lower() in ("high", "low"):
+                    abnormal += 1
+        # Alternate shape: { labs: { analytes: [{name, ...}, ...] } }
+        labs = structured.get("labs") if isinstance(structured.get("labs"), dict) else None
+        analytes = labs.get("analytes") if isinstance(labs, dict) else None
+        if isinstance(analytes, list):
+            for a in analytes:
+                if not isinstance(a, dict):
+                    continue
+                nm = a.get("name") or a.get("analyte")
+                if isinstance(nm, str) and nm and nm not in names:
+                    names.append(nm)
+                flag = (a.get("abnormal") or a.get("status") or a.get("flag") or "")
+                if isinstance(flag, str) and flag.lower() in ("high", "low"):
+                    abnormal += 1
+        # Fallback: top-level keys that look like analytes (e.g., Ferritin)
+        # Only consider a small whitelist to avoid noise
+        KNOWN_KEYS = {
+            "Ferritin", "LDL", "HDL", "Glucose", "Hemoglobin", "WBC", "Platelets", "Creatinine",
+            "AST", "ALT", "TSH", "Triglycerides", "CRP",
+        }
+        for k, v in structured.items():
+            if k in KNOWN_KEYS and k not in names:
+                names.append(k)
+        return names, abnormal
+
+    def _is_valid_lab_obj(structured: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(structured, dict) or not structured:
+            return False
+        # Valid if tests list has one or more items
+        tests = structured.get("tests")
+        if isinstance(tests, list) and len(tests) > 0:
+            return True
+        # Or if labs.analytes exists and non-empty
+        labs = structured.get("labs") if isinstance(structured.get("labs"), dict) else None
+        analytes = labs.get("analytes") if isinstance(labs, dict) else None
+        if isinstance(analytes, list) and len(analytes) > 0:
+            return True
+        # Or if any known analyte keys (like Ferritin) are present
+        names, _ = _extract_analytes_and_abnormal(structured)
+        return len(names) > 0
+
     latest_lab_struct_early: Optional[Dict[str, Any]] = None
     lab_source = "none"
     try:
         # a) current (middleware may attach to request.state)
         current = getattr(request.state, "structured_lab", None)
-        if isinstance(current, dict) and current:
-            latest_lab_struct_early = current
+        cur_obj = _deserialize_structured(current) if not isinstance(current, dict) else current
+        if _is_valid_lab_obj(cur_obj):
+            latest_lab_struct_early = cur_obj
             lab_source = "current"
         else:
             # b) cache (per-user)
             cached = get_latest_lab_cache(str(user.id))
-            if isinstance(cached, dict) and cached:
+            if _is_valid_lab_obj(cached):
                 latest_lab_struct_early = cached
                 lab_source = "cache"
             else:
-                # c) DB (most recent with non-null/non-empty structured_json)
+                # c) DB (most recent rows; do not assume non-null
                 candidates = (
                     db.query(LabReport)
-                    .filter(LabReport.user_id == str(user.id), LabReport.structured_json.isnot(None))
+                    .filter(LabReport.user_id == str(user.id))
                     .order_by(LabReport.created_at.desc())
-                    .limit(5)
+                    .limit(10)
                     .all()
                 )
                 chosen: Optional[Dict[str, Any]] = None
                 for lr in candidates:
-                    sj = getattr(lr, "structured_json", None)
-                    if isinstance(sj, dict) and sj:
-                        chosen = sj
-                        break
+                    sj_raw = getattr(lr, "structured_json", None)
+                    sj = _deserialize_structured(sj_raw) if not isinstance(sj_raw, dict) else (sj_raw or None)
+                    if not _is_valid_lab_obj(sj):
+                        continue
+                    chosen = sj
+                    break
                 latest_lab_struct_early = chosen
                 lab_source = "db" if chosen is not None else "none"
         # store on request for downstream consumers
@@ -1012,18 +1093,7 @@ async def chat(
         lab_source = "none"
     # Single lab_context log per request
     try:
-        analyte_names: list = []
-        abnormal_count = 0
-        if isinstance(latest_lab_struct_early, dict):
-            tests = latest_lab_struct_early.get("tests") or []
-            if isinstance(tests, list):
-                for t in tests:
-                    nm = (t or {}).get("name")
-                    if nm and nm not in analyte_names:
-                        analyte_names.append(nm)
-                    ab = (t or {}).get("abnormal") or (t or {}).get("status")
-                    if isinstance(ab, str) and ab.lower() in ("high", "low"):
-                        abnormal_count += 1
+        analyte_names, abnormal_count = _extract_analytes_and_abnormal(latest_lab_struct_early)
         logger.info({
             "function": "lab_context",
             "request_id": request_id,
