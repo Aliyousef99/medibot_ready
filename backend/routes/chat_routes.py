@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+from pydantic import BaseModel
 
 from backend.db.session import SessionLocal
 from backend.auth.deps import get_current_user
@@ -20,9 +21,9 @@ from backend.services import summarizer
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
-class StartChatIn(dict):
-    title: Optional[str]
-    active_lab_id: Optional[str]
+class StartChatIn(BaseModel):
+    title: Optional[str] = None
+    active_lab_id: Optional[str] = None
 
 
 @router.post("/start")
@@ -30,8 +31,8 @@ def start_chat(
     payload: StartChatIn = Body(...),
     current_user: User = Depends(get_current_user),
 ):
-    title = (payload.get("title") or "").strip() or None
-    active_lab_id = (payload.get("active_lab_id") or "").strip() or None
+    title = (payload.title or "").strip() or None
+    active_lab_id = (payload.active_lab_id or "").strip() or None
 
     with SessionLocal() as db:
         conv = Conversation(user_id=str(current_user.id), title=title, active_lab_id=active_lab_id)
@@ -41,7 +42,7 @@ def start_chat(
     return {"conversation_id": conv.id}
 
 
-class SendIn(dict):
+class SendIn(BaseModel):
     conversation_id: str
     message: str
 
@@ -76,8 +77,8 @@ async def send_message(
     payload: SendIn = Body(...),
     current_user: User = Depends(get_current_user),
 ):
-    conv_id = (payload.get("conversation_id") or "").strip()
-    text = (payload.get("message") or "").strip()
+    conv_id = (payload.conversation_id or "").strip()
+    text = (payload.message or "").strip()
     if not conv_id or not text:
         raise HTTPException(status_code=422, detail="conversation_id and message are required")
 
