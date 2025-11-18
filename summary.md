@@ -1,173 +1,126 @@
-## Updated Summary (2025-10-19)
-
-- Changes at a glance
-  - Frontend service `frontend/src/services/api.ts` now exposes `getHistory`, `getHistoryDetail`, `deleteHistory`, and `getRecommendationsForLab`, plus shared types `LabReport` and `RecommendationSet`. It uses an axios instance with an auth interceptor (not a custom `fetchApi` wrapper).
-  - History page `frontend/src/pages/History.tsx` is wired to those APIs, fixes types (IDs are `string`), and uses `structured_json`.
-  - Frontend TypeScript config added at `frontend/tsconfig.json` with `jsx: "react-jsx"` and `moduleResolution: "Bundler"` to resolve React and `lucide-react` typings. Production build succeeds.
-  - Dedicated recommendations endpoint exists at `POST /api/recommendations/generate` (backend/routes/recs_routes.py) using a rules engine (`backend/services/recs.py`) with optional LLM rendering for user-facing copy.
-  - Backend tests are present (pytest) under `backend/tests` with `pytest.ini` at repo root. Frontend testing libs are installed but no frontend test files were added.
-
-- Corrected interface notes
-  - Keep authentication and profile endpoints as documented.
-  - Lab history endpoints: `GET /api/history/labs`, `GET /api/history/labs/{lab_id}`, `DELETE /api/history/labs/{lab_id}` are implemented and consumed by the frontend.
-  - Add recommendations: `POST /api/recommendations/generate` (request may include `lab_id`, `labs`, `symptoms`, `patient_info`). Response conforms to `RecommendationSet`.
-
-- Current state of development (updated)
-  - Fully functional: Authentication, Database/Models, Lab Report Interpretation (OCR, NER, explanation), User Profile, Lab Report History.
-  - Recommendations: Functional rules-based engine (risk scoring and actions) with optional LLM to render patient copy.
-  - Symptom Analysis: Still LLM‑based for general queries; no dedicated model.
-  - Testing: Backend tests exist (pytest). Frontend: testing deps present but no tests authored.
-  - Linting: Not configured.
-
-- Frontend details
-  - `api.ts` centralizes axios with JWT injection via interceptor and defines `LabReport`/`RecommendationSet` types.
-  - `History.tsx` uses those APIs; delete/view flows use modal and confirmation, with improved typing.
-  - `tsconfig.json` ensures proper JSX/typing and removes prior TS errors about `react` and `react/jsx-runtime`.
-
----
-
-## Previous Version
-
 ## 1. Introduction
 
-The project is a web-based, AI-powered medical assistant named "MediBot". It allows users to upload medical lab reports, view their health history, and ask questions about their results. The backend is built with Python and the FastAPI framework, while the frontend is a single-page application built with React and Vite.
-
-The core technologies employed are:
-
-*   **Backend:** FastAPI, SQLAlchemy (with SQLite), Uvicorn
-*   **Frontend:** React, Vite, Tailwind CSS
-*   **AI/ML:**
-    *   Hugging Face Transformers (BioBERT for NER)
-    *   Google Gemini for natural language explanations and chat
-    *   Pytesseract for OCR
-*   **Authentication:** JWT (JSON Web Tokens)
-
-The architecture follows a classic client-server model. The React frontend communicates with the FastAPI backend via a RESTful API. The backend handles business logic, database interactions, and integrations with third-party AI services.
+- Purpose: AI‑assisted medical companion that parses lab reports, extracts entities, explains results, and supports chat/Q&A with profile context.
+- Primary stacks:
+  - Backend: FastAPI, SQLAlchemy ORM (SQLite by default), Pydantic v2, httpx, slowapi rate limiting.
+  - Frontend: React 18 + Vite + Tailwind; Axios with JWT interceptor.
+  - AI/OCR: Optional Transformers (BioBERT/NER) with heuristic fallbacks, Google Gemini via REST, PyPDF and Tesseract OCR.
+- Architecture: SPA → REST API → services (OCR, parsing, rules, optional NER/LLM) → DB. Modular services exist under `backend/services/**`, with some legacy/monolithic logic in `backend/app.py`.
 
 ## 2. Object Design Trade-offs
 
-*   **FastAPI vs. Django:** The choice of FastAPI suggests a preference for performance, asynchronous programming, and a more lightweight, less opinionated framework compared to Django. This is suitable for an API-centric application.
-*   **React vs. Other Frameworks:** React with Vite provides a fast and modern development experience for building a dynamic user interface.
-*   **SQLAlchemy Core vs. ORM:** The project uses the SQLAlchemy ORM, which simplifies database interactions by mapping Python objects to database tables. This improves developer productivity at the cost of some performance overhead compared to using SQLAlchemy Core directly.
-*   **Environment-based Configuration:** The use of `.env` files for configuration (e.g., API keys, database URLs) is a good practice for separating configuration from code, but it requires careful management of environment variables in different deployment environments.
-*   **Fallback Mechanisms:** The NER service in `backend/app.py` has a fallback mechanism to a simpler BERT model if the primary BioBERT model fails to load. This improves robustness but may result in lower accuracy.
+- FastAPI + SQLAlchemy selected for lightweight, async‑friendly API development and simple persistence; defaults to SQLite with easy swap to Postgres via `DATABASE_URL` (backend/db/session.py).
+- Parsing strategy prefers deterministic heuristics with optional Transformer NER for resilience and light runtime deps. Two parsers coexist:
+  - Heuristic table/keyword parser in `backend/services/lab_parser.py` (modular, used by pipelines).
+  - A newer, expanded parser inside `backend/app.py` with placeholder NER hooks. Duplication increases maintenance cost.
+- LLM access via direct REST to Gemini instead of heavyweight SDK, reducing dependencies but requiring manual payload shaping and error handling.
+- Mixed design: feature‑routers in `backend/routes/**` (auth, history, symptoms, recs, chat) alongside a combined orchestration endpoint in `backend/app.py` (`/api/chat`). Coexistence can confuse clients if not documented.
+- Rate limiting with slowapi plus graceful no‑op fallback keeps dev ergonomics while enabling prod hardening.
 
 ## 3. Interface Documentation Guidelines
 
-The frontend communicates with the backend via a RESTful API with a base path of `/api`. The communication format is JSON. Authentication is handled via JWTs sent in the `Authorization` header.
-
-Key API endpoints defined in `backend/app.py` and `frontend/src/services/api.ts` include:
-
-*   **Authentication:**
-    *   `POST /api/auth/register`: Creates a new user.
-    *   `POST /api/auth/login`: Authenticates a user and returns a JWT.
-*   **User Profile:**
-    *   `GET /api/profile/`: Retrieves the current user's profile.
-    *   `PUT /api/profile/`: Updates the user's profile.
-*   **Lab Reports & History:**
-    *   `POST /api/extract_text`: Extracts text from an uploaded file (PDF or image).
-    *   `POST /api/parse_lab`: Parses the extracted text to identify medical entities.
-    *   `POST /api/explain`: Generates a patient-friendly explanation of lab results using Gemini.
-    *   `POST /api/chat`: Handles conversational chat with the user, using their profile and lab history as context.
-    *   `GET /api/history/labs`: Retrieves a list of the user's past lab reports.
-    *   `GET /api/history/labs/{lab_id}`: Retrieves the details of a specific lab report.
-    *   `DELETE /api/history/labs/{lab_id}`: Deletes a lab report.
-
-The frontend service `frontend/src/services/api.ts` provides a `fetchApi` wrapper that automatically includes the JWT in requests.
+- Protocols: REST, JSON. Auth via Bearer JWT in `Authorization` header. Frontend stores auth in `localStorage` and injects on requests (`frontend/src/services/api.ts`).
+- Key endpoints (paths → module):
+  - Auth: `POST /api/auth/register`, `POST /api/auth/login` → `backend/routes/auth_routes.py`.
+  - Profile: `GET/PUT /api/profile/` → `backend/routers/profile.py`.
+  - Lab parsing: `POST /api/parse_lab` → `backend/app.py` (heuristic + placeholder NER inside app file).
+  - Explain labs: `POST /api/explain` → `backend/app.py` (Gemini REST or offline fallback); sets `X-Lab-Id` header on success.
+  - OCR: `POST /api/extract_text` → `backend/app.py` (PDF via PyPDF; images via Tesseract; strict MIME/size checks).
+  - Symptoms (modular): `POST /api/symptoms/analyze`, `POST /api/symptoms/parse` → `backend/routes/symptoms_routes.py` (lexicon‑based pipeline in `backend/services/symptoms.py`).
+  - Chat (combined): `POST /api/chat` → `backend/app.py` (builds profile+lab context, inline lab extraction, triage+recommendations, Gemini explanation).
+  - Chat (conversations): `POST /api/chat/start`, `POST /api/chat/send`, `GET /api/chat/{id}/history` → `backend/routes/chat_routes.py` (persists messages; LLM call stubbed).
+  - History (labs): `GET/POST/GET/DELETE /api/history/labs[/…]` → `backend/routes/history_routes.py` (persists `LabReport`).
+  - Recommendations: `POST /api/recommendations/generate` → `backend/routes/recs_routes.py` (rules in `backend/services/recs.py`).
+  - Models list: `GET /api/list_models` → `backend/app.py` (Gemini discovery; requires `GEMINI_API_KEY`).
+- Frontend usage:
+  - `postChatMessage('/api/chat')` returns a composite payload with `symptom_analysis`, `local_recommendations`, `ai_explanation`, and optional `user_view` (`frontend/src/services/api.ts`).
+  - History and recs flows call `/api/history/*` and `/api/recommendations/generate` (`frontend/src/pages/History.tsx`).
 
 ## 4. Engineering Standards
 
-*   **Folder Structure:** The project has a clear separation between the `frontend` and `backend` directories. Within the backend, there are further subdivisions for `auth`, `db`, `models`, `routes`, `schemas`, and `services`.
-*   **Naming Conventions:** The code generally follows Python's PEP 8 and TypeScript's standard naming conventions.
-*   **Error Handling:** The backend uses FastAPI's `HTTPException` to return appropriate HTTP error codes and messages. The frontend has a basic `ErrorBoundary.tsx` component.
-*   **Logging:** The backend has a JSON-based logger configured in `backend/app.py`.
-*   **Testing:** There is no evidence of a testing framework being used in the provided file structure (e.g., no `tests` directory with `pytest` files).
-*   **Linting:** There are no explicit linting configurations (e.g., `.eslintrc`, `pyproject.toml` with ruff/flake8 settings) visible in the file listing.
-*   **Comments & Docstrings:** The code has a good amount of comments and docstrings, especially in the backend, explaining the purpose of functions and modules.
+- Structure: `backend/{app.py,routes,routers,services,auth,db,models,schemas,tests}` and `frontend/src/{components,pages,services}` are consistent and clear.
+- Logging: JSON formatter with `trace_id` middleware (`backend/middleware/tracing.py`, `backend/app.py`); rate limit handler returns 429 with `Retry-After`.
+- Error envelope: Standardized handlers exist in `backend/utils/exceptions.py` but are not registered on the FastAPI app; tests expect envelope fields (`code/message/trace_id`). This is a gap.
+- Validation: Pydantic v2 models across request/response schemas; file uploads size/type validated.
+- Tests: Pytest suite under `backend/tests` covers rate limits, security envelope, chat, symptoms, and recs. CI runs on GitHub Actions (`.github/workflows/CI.yml`).
+- Frontend: TypeScript + React; no ESLint/Prettier config checked in; DOMPurify used to sanitize rendered HTML in chat UI.
 
 ## 5. Detailed Component Design
 
-### 5.1 User Authentication Module
+- 5.1 User Authentication Module
+  - Files: `backend/routes/auth_routes.py`, `backend/auth/{deps.py,jwt.py}`, models in `backend/models/user.py`.
+  - JWT: Created via `create_access_token` (python‑jose HS256); validated by `get_current_user` (HTTPBearer). Passwords hashed with `passlib` PBKDF2, bcrypt fallback; legacy plaintext tolerated as final fallback.
+  - Demo seed: `_maybe_seed_demo_user()` on startup (`backend/app.py`) creates `demo@example.com` if missing.
+  - Missing: Refresh tokens/rotation, lockout/2FA, and CSRF mitigations for non‑JWT flows. `deps.py` prints credentials to stdout (debug leak risk).
 
-*   **Location:** `backend/auth/`, `backend/routes/auth_routes.py`
-*   **Implementation:** JWT-based authentication is implemented using the `python-jose` library. Passwords are hashed with `pbkdf2_sha256`. The `get_current_user` dependency in `backend/auth/deps.py` protects routes that require authentication.
-*   **State:** ✅ **Fully functional**
+- 5.2 Symptom Analysis Module
+  - Two paths exist:
+    - Heuristic mapper `backend/services/symptom_analysis.py:analyze_text` used by `/api/analyze_symptoms` and the combined chat pipeline. Extracts canonical symptoms and suggests likely tests; returns confidence.
+    - Lexicon+NER pipeline `backend/services/symptoms.py` with resources lexicon, negation, urgency classifier; routed by `/api/symptoms/*` and persists `SymptomEvent`. Optional NER fallback via `backend/services/ner.py`.
+  - Persistence: `SymptomEvent` model (`backend/models/symptom_event.py`) recorded by both paths in different places.
+  - Status: Functional heuristics; duplication between modules; NER optional.
 
-### 5.2 Symptom Analysis Module
+- 5.3 Medical Report Interpretation Module
+  - OCR: `POST /api/extract_text` in `backend/app.py` accepts PDF/images, enforces size/MIME, uses PyPDF or Tesseract; returns `{text}`.
+  - Parsing:
+    - Modular parser `backend/services/lab_parser.py` (row patterns, bracket ranges, status, conditions) used by `backend/services/report_pipeline.py`.
+    - In‑file parser `backend/app.py:parse_lab_text` enhances heuristics and provides placeholders for NER integration; `/api/parse_lab` persists `LabReport` and caches structured JSON.
+  - NER/Glossary enrich: `backend/services/ner.py` (optional Transformers pipeline; heuristic fallback) and `backend/services/glossary.py` (local definitions + Gemini fetch).
+  - Explain: `POST /api/explain` calls Gemini 2.5‑flash via REST (httpx) or returns an offline summary fallback; persists `LabReport` and exposes `X-Lab-Id` response header.
+  - Status: Heuristic extraction is robust; NER is optional and partially stubbed in `backend/app.py` path; the modular pipeline is more cohesive.
 
-*   **Location:** `backend/app.py` (within the `/api/chat` endpoint)
-*   **Implementation:** The `/api/chat` endpoint can receive free-text user queries that may contain symptoms. It uses a keyword-based approach (`_is_question_relevant_to_labs`) to determine if the question is relevant to medical topics. The actual analysis is then performed by the Gemini large language model.
-*   **State:** ⚠️ **Partially implemented** (relies on a general-purpose LLM rather than a dedicated symptom analysis model).
+- 5.4 Personalized Recommendation Engine
+  - Rules engine: `backend/services/recs.py` loads YAML rules (`backend/config/clinical_rules.yaml`) to compute risk tier and build action lists.
+  - API: `POST /api/recommendations/generate` creates a `RecommendationSet` row and returns it (`backend/routes/recs_routes.py`).
+  - LLM copy: `render_patient_copy` attempts Gemini‑based rewrite when `GEMINI_API_KEY` is set; otherwise uses a templated fallback. The referenced `gemini.rewrite_patient_copy` is not implemented in `backend/services/gemini.py` (only `generate_chat` exists) → incomplete integration.
 
-### 5.3 Medical Report Interpretation Module
+- 5.5 Database and Models
+  - SQLAlchemy models: `User`, `UserProfile`, `LabReport`, `SymptomEvent`, `RecommendationSet`, `Conversation`, `Message` (`backend/models/**`). Dialect‑aware UUID/JSON types; timestamps defaulted server‑side.
+  - Engine/session: `backend/db/session.py` (SQLite default, `check_same_thread=False`), `init_db()` in `backend/models/__init__.py` creates schema; `backend/create_tables.py` helper.
+  - Relationships: Users ↔ Profile (1–1), Users ↔ LabReports/Recommendations (1–N), Conversations ↔ Messages (1–N).
 
-*   **Location:** `backend/services/`, `backend/app.py`
-*   **Implementation:** This is a multi-stage pipeline:
-    1.  **OCR:** `extract_text` in `backend/app.py` uses `pytesseract` for images and `pypdf` for PDFs.
-    2.  **NER:** `parse_lab_text` in `backend/app.py` uses a Hugging Face `ner` pipeline with a BioBERT model (`d4data/biobert_ner`) to extract medical entities. It has a fallback to a simpler model (`dslim/bert-base-NER`) and a heuristic-based parser (`_parse_lab_text_heuristic`) if the NER models fail.
-    3.  **Explanation:** The `/api/explain` endpoint sends the structured data to the Gemini API to generate a patient-friendly explanation.
-*   **State:** ✅ **Fully functional** (with fallback mechanisms).
-
-### 5.4 Personalized Recommendation Engine
-
-*   **Location:** `backend/app.py` (within the `/api/chat` endpoint)
-*   **Implementation:** The `/api/chat` endpoint constructs a detailed prompt for the Gemini API, including the user's profile (age, sex, conditions, medications) and their most recent lab report. This allows Gemini to provide personalized, context-aware responses.
-*   **State:** ⚠️ **Partially implemented** (recommendations are generated by a general-purpose LLM and are not based on a dedicated recommendation engine).
-
-### 5.5 Database and Models
-
-*   **Location:** `backend/models/`, `backend/db/`
-*   **Implementation:** The database schema is defined using SQLAlchemy ORM. The main models are `User`, `UserProfile`, and `LabReport`. The database is initialized in `backend/app.py` using the `init_db` function. The project is configured to use a SQLite database (`medibot.db`).
-*   **State:** ✅ **Fully functional**
-
-### 5.6 Third-Party Integrations
-
-*   **Google Gemini:** Used for chat responses and explaining lab results. Integrated via direct HTTP requests to the Gemini API in `backend/app.py`.
-*   **Hugging Face:** Used for the NER pipeline. The `transformers` library downloads and runs the models locally.
-*   **Pytesseract:** Used for OCR. This requires a local installation of the Tesseract OCR engine.
+- 5.6 Third‑Party Integrations
+  - Gemini: direct REST calls for chat explanation and labs explanation (`backend/app.py`); list models endpoint; API key via env. No official SDK dependency.
+  - Transformers: optional NER (BioBERT or fallback) with graceful degradation to heuristics (`backend/services/ner.py`).
+  - OCR/PDF: Tesseract via `pytesseract`, PDF via `pypdf`.
+  - Security libs: `python-jose` for JWT, `passlib` for hashing.
 
 ## 6. UML-Level Notes (Informal)
 
-The data flow can be summarized as follows:
-
-1.  **User Interaction:** The user interacts with the React frontend.
-2.  **API Request:** The frontend sends API requests to the FastAPI backend.
-3.  **Authentication:** The backend verifies the user's JWT for protected endpoints.
-4.  **Business Logic:** The backend processes the request, which may involve:
-    *   Querying the database (e.g., to get user profile or lab history).
-    *   Calling the Gemini API for chat or explanations.
-    *   Running the OCR and NER pipelines for lab report analysis.
-5.  **Database:** The backend reads from and writes to the SQLite database via SQLAlchemy.
-6.  **API Response:** The backend sends a JSON response to the frontend.
-7.  **UI Update:** The frontend updates the UI based on the API response.
-
-Async patterns are used extensively in the FastAPI backend, particularly for handling HTTP requests and calling the Gemini API.
+- Frontend (React) → Axios → Backend (FastAPI) → Services (OCR, lab parser, symptoms, recs, glossary, NER) → DB (SQLAlchemy).
+- Combined chat flow (`/api/chat`):
+  - Build user context (profile, latest lab, recent symptoms/history) → inline lab extraction for pasted text → rule triage (`red_flag_triage`, `lab_triage`) + recommendations → optionally call Gemini for explanation → return composite payload.
+- Async usage: httpx AsyncClient for Gemini; slowapi middlewares; pure functions in services enable testing.
 
 ## 7. Current State of Development
 
-*   ✅ **Fully functional / tested:**
-    *   User Authentication (registration, login)
-    *   Database and Models
-    *   Medical Report Interpretation (OCR, NER, explanation)
-    *   User Profile Management
-    *   Lab Report History
+- ✅ Fully functional / tested
+  - Auth (JWT, hashing, register/login): `backend/routes/auth_routes.py`, tests in `backend/tests` (auth used via overrides).
+  - Profiles and persistence: `backend/routers/profile.py`, `backend/models/**`.
+  - OCR and heuristic lab parsing: `/api/extract_text`, `/api/parse_lab`, `backend/services/lab_parser.py` and caching/persistence into `LabReport`.
+  - Recommendations (rules engine) and route: `backend/services/recs.py`, `backend/routes/recs_routes.py`.
+  - History endpoints and UI consumption: `backend/routes/history_routes.py`, `frontend/src/pages/History.tsx`.
+  - Rate limiting + tracing middleware.
 
-*   ⚠️ **Partially implemented:**
-    *   Symptom Analysis (relies on Gemini, no dedicated model)
-    *   Personalized Recommendation Engine (relies on Gemini, no dedicated engine)
-    *   Error Handling (basic implementation)
+- ⚠️ Partially implemented
+  - Chat: `/api/chat` integrates many parts and calls Gemini when configured; works end‑to‑end but depends on API key and returns fallback explanation otherwise.
+  - Symptom analysis: two distinct implementations (`services/symptom_analysis.py` and `services/symptoms.py`) and route duplication (`/api/analyze_symptoms` in app vs `/api/symptoms/*`). Needs consolidation.
+  - NER: Optional HF pipeline available in `backend/services/ner.py`; the app‑inline NER hooks are placeholders.
+  - Error envelope: Handlers exist but not registered on `app`; tests reference envelope behavior—wiring is missing in `backend/app.py`.
+  - LLM copywriter for recs: function referenced but not implemented (`gemini.rewrite_patient_copy`).
 
-*   🚧 **Placeholder or stubbed:**
-    *   **Testing:** No automated tests are present.
-    *   **Admin Interface:** No admin interface is available.
-
-There are no explicit `TODO` comments in the provided code, but the lack of a dedicated testing suite is a significant gap.
+- 🚧 Placeholder or stubbed
+  - `backend/services/gemini.py:generate_chat` returns empty string; chat_routes relies on it for replies.
+  - `backend/services/summarizer.py` returns trivial summary; used for conversation trimming.
+  - Some legacy top‑level scripts/files (e.g., `symptoms.py`, `ner.py` at repo root) appear experimental and unused by the main app.
 
 ## 8. Recommendations for Next Steps
 
-*   **Add Automated Tests:** Introduce a testing framework like `pytest` for the backend and `jest`/`@testing-library/react` for the frontend. This is the highest priority to ensure code quality and prevent regressions.
-*   **Improve Error Handling:** Enhance the error handling in both the frontend and backend to provide more specific and user-friendly error messages.
-*   **Refactor AI Service Calls:** The calls to the Gemini API are spread throughout `backend/app.py`. Refactor these into a dedicated `services/gemini.py` module to centralize the logic and make it more maintainable.
-*   **Configuration Management:** For a production environment, consider using a more robust configuration management solution than just `.env` files, such as HashiCorp Vault or AWS Secrets Manager.
-*   **Add Linting and Formatting:** Integrate tools like `ruff` or `black` for the backend and `eslint` and `prettier` for the frontend to enforce consistent code style.
-*   **Documentation:** While the code has some comments, generating API documentation using FastAPI's automatic docs generation and adding more detailed documentation for the frontend components would be beneficial.
+- Consolidate lab parsing: Remove duplication by routing all parsing through `backend/services/lab_parser.py` and deleting/isolating the app‑inline parser. Keep NER integration behind a single service API.
+- Wire error envelope: Register handlers from `backend/utils/exceptions.py` in `backend/app.py` for `HTTPException` and generic exceptions to meet test/docs expectations and consistently return `{code,message,trace_id}`.
+- Unify symptom modules: Choose one pipeline (`services/symptoms.py` preferred for richer structure) and make both routes consume the same service; remove `/api/analyze_symptoms` in app or alias it.
+- Complete Gemini integration: Implement `rewrite_patient_copy(actions)` in `backend/services/gemini.py` and consider moving shared Gemini REST logic there (used by chat and explain) with timeouts and retries.
+- Security hardening: Remove debug prints (credentials in `backend/auth/deps.py`), add token refresh/rotation, consider per‑user rate buckets consistently, and sanitize all LLM‑rendered content in UI (already uses DOMPurify).
+- Tooling and quality: Add ESLint/Prettier config for frontend; add ruff/black/mypy for backend; expand pytest coverage around error envelopes, `/api/explain` headers, and duplicate routes; include minimal vitest for UI API adapters.
+- Config/docs: Provide `backend/.env.example`, document required OCR dependencies per OS, and clarify that only English is supported (already in README).
+

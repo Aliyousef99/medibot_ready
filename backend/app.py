@@ -32,6 +32,7 @@ from backend.models.user import User, UserProfile
 from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
+from backend.routes import chat_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
 from backend.services.recommendations import recommend, red_flag_triage, lab_triage
@@ -78,6 +79,7 @@ def configure_logging() -> logging.Logger:
 logger = configure_logging()
 
 # ---- Rate limiting (slowapi) ----
+app.add_middleware(TracingMiddleware)
 try:
     from slowapi import Limiter
     from slowapi.util import get_remote_address
@@ -238,6 +240,7 @@ app.include_router(auth_routes.router)
 app.include_router(history_routes.router)
 app.include_router(profile_router)   # profile PUT/GET live here
 app.include_router(symptoms_routes.router)
+app.include_router(chat_routes.router)
 app.include_router(recs_routes.router, prefix="/api/recommendations")
 
 # --- schemas ---
