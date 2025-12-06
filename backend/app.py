@@ -54,6 +54,7 @@ NER_DEVICE = (os.getenv("NER_DEVICE") or "auto").strip().lower()  # "auto" | "cp
 NER_MAX_CHARS = int(os.getenv("NER_MAX_CHARS") or 4000)
 NER_TIMEOUT_SECONDS = float(os.getenv("NER_TIMEOUT_SECONDS") or 8.0)
 CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS")
+CORS_ORIGIN_REGEX = (os.getenv("CORS_ORIGIN_REGEX") or "").strip() or None
 if CORS_ORIGINS_RAW:
     CORS_ALLOW_ORIGINS = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
 else:
@@ -267,13 +268,14 @@ def _init_db():
     _init_redis()
     _maybe_seed_demo_user()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS if "*" not in CORS_ALLOW_ORIGINS else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOW_ORIGINS if "*" not in CORS_ALLOW_ORIGINS else ["*"],
+        allow_origin_regex=CORS_ORIGIN_REGEX,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # include existing routers
 app.include_router(auth_routes.router)
