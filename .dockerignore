@@ -1,0 +1,10 @@
+# Reduce build context size
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+frontend/
+*.pyc
+*.pyo
+*.swp
