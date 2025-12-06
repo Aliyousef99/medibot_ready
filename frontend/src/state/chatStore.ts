@@ -28,9 +28,38 @@ function seedMessages(): Message[] {
   ];
 }
 
-const CHAT_STORAGE_KEY = "medibot.chat";
+const CHAT_STORAGE_PREFIX = "medibot.chat";
+const DEFAULT_SCOPE = "guest";
+
+function deriveScopeFromUser(user: { id?: string | number; email?: string } | null | undefined): string {
+  if (user && user.id !== undefined && user.id !== null) return String(user.id);
+  if (user && user.email) return String(user.email);
+  return DEFAULT_SCOPE;
+}
+
+function deriveScopeFromLocalAuth(): string {
+  try {
+    const saved = localStorage.getItem("auth");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      return deriveScopeFromUser(parsed);
+    }
+  } catch {
+    // ignore malformed auth payloads
+  }
+  return DEFAULT_SCOPE;
+}
+
+function chatStorageKey(scope: string): string {
+  return `${CHAT_STORAGE_PREFIX}.${scope || DEFAULT_SCOPE}`;
+}
+
+export function chatScopeForUser(user: { id?: string | number; email?: string } | null | undefined): string {
+  return deriveScopeFromUser(user);
+}
 
 type ChatState = {
+  storageScope: string;
   conversations: Conversation[];
   activeId: string | null;
   structuredById: Record<string, any>;
@@ -71,12 +100,14 @@ type ChatActions = {
   addConversation: (title?: string) => string;
   deleteConversation: (id: string) => void;
   setConversations: (c: Conversation[]) => void;
-   resetChat: () => void;
+  resetChat: (scope?: string | null) => void;
 };
 
 export type ChatStore = ChatState & ChatActions;
 
-function loadInitialState(): ChatState {
+function loadInitialState(scope?: string | null): ChatState {
+  const storageScope = scope || deriveScopeFromLocalAuth();
+  const storageKey = chatStorageKey(storageScope);
   let devMode = false;
   let dark = true;
   let sidebarOpen = true;
@@ -90,7 +121,7 @@ function loadInitialState(): ChatState {
     if (sb !== null) sidebarOpen = sb === "1" || sb === "true";
     hideProfileBanner = sessionStorage.getItem("hideProfileBanner") === "1";
 
-    const saved = localStorage.getItem(CHAT_STORAGE_KEY);
+    const saved = localStorage.getItem(storageKey);
     if (saved) {
       const parsed = JSON.parse(saved);
       const reviveMsgs = (msgs: any[]) =>
@@ -100,6 +131,7 @@ function loadInitialState(): ChatState {
         messages: reviveMsgs(c.messages || []),
       }));
       return {
+        storageScope,
         conversations: revivedConvos,
         activeId: parsed.activeId ?? revivedConvos[0]?.id ?? null,
         structuredById: parsed.structuredById || {},
@@ -124,6 +156,7 @@ function loadInitialState(): ChatState {
   }
   const initialConversations: Conversation[] = [{ id: "c1", title: "Welcome", messages: seedMessages() }];
   return {
+    storageScope,
     conversations: initialConversations,
     activeId: initialConversations[0]?.id ?? null,
     structuredById: {},
@@ -246,7 +279,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         conversations: convos,
         activeId: safeActiveId(convos, s.activeId),
       })),
-    resetChat: () => set(() => loadInitialState()),
+    resetChat: (scope) => set(() => loadInitialState(scope)),
   };
 });
 
@@ -271,7 +304,8 @@ useChatStore.subscribe((state) => {
       symptomAnalysisResult: state.symptomAnalysisResult,
       input: state.input,
     };
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(payload));
+    const storageKey = chatStorageKey(state.storageScope || deriveScopeFromLocalAuth());
+    localStorage.setItem(storageKey, JSON.stringify(payload));
   } catch {
     // best-effort persistence
   }

@@ -8,7 +8,7 @@ import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
 import { postChatMessage as apiChat, extractText as apiExtract } from "../services/api";
 import type { ChatResponseCombined } from "../services/api";
-import { useChatStore } from "../state/chatStore";
+import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
 import { useToastStore } from "../state/toastStore";
 import type { Message } from "../types";
@@ -35,7 +35,7 @@ function prettyRef(ref?: any) {
 function ChatView() {
   const { user, setUser, logout } = useAuth();
   const { add: addToast } = useToastStore();
-  const lastUserRef = useRef<string | null>(null);
+  const lastScopeRef = useRef<string | null>(null);
   const conversations = useChatStore((s) => s.conversations);
   const activeId = useChatStore((s) => s.activeId);
   const structuredById = useChatStore((s) => s.structuredById);
@@ -85,11 +85,11 @@ function ChatView() {
 
   // Reset chat state when switching users to avoid showing previous user's history
   useEffect(() => {
-    const current = user?.email || null;
-    if (current && lastUserRef.current && current !== lastUserRef.current) {
-      actions.resetChat();
+    const scope = chatScopeForUser(user);
+    if (lastScopeRef.current === null || lastScopeRef.current !== scope) {
+      actions.resetChat(scope);
     }
-    lastUserRef.current = current;
+    lastScopeRef.current = scope;
   }, [user, actions]);
 
   useEffect(() => {
