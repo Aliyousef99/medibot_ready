@@ -65,12 +65,18 @@ export interface RecommendationSet {
   created_at?: string;
 }
 
+// Resolve API base in priority order:
+// 1) window.__CHAT_API_BASE__ (runtime override)
+// 2) VITE_API_BASE env (set in Vercel / .env)
+// 3) same-origin (relative /api calls when backend is hosted together)
 const runtimeBase =
   typeof window !== 'undefined' && (window as any).__CHAT_API_BASE__
     ? String((window as any).__CHAT_API_BASE__)
     : '';
 const envBase = (import.meta as any)?.env?.VITE_API_BASE ? String((import.meta as any).env.VITE_API_BASE) : '';
-const resolvedBase = (runtimeBase || envBase || 'http://localhost:8000').replace(/\/+$/, '');
+const fallbackBase =
+  typeof window !== 'undefined' && window.location ? window.location.origin : '';
+const resolvedBase = (runtimeBase || envBase || fallbackBase || '').replace(/\/+$/, '');
 
 const api = axios.create({
   baseURL: resolvedBase,
