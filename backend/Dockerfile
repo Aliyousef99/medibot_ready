@@ -19,11 +19,11 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps first for better caching
-COPY backend/requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
 # Copy application code
-COPY backend /app
+COPY . /app
 
 EXPOSE 8000
 
