@@ -54,7 +54,7 @@ NER_DEVICE = (os.getenv("NER_DEVICE") or "auto").strip().lower()  # "auto" | "cp
 NER_MAX_CHARS = int(os.getenv("NER_MAX_CHARS") or 4000)
 NER_TIMEOUT_SECONDS = float(os.getenv("NER_TIMEOUT_SECONDS") or 8.0)
 CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS")
-CORS_ORIGIN_REGEX = (os.getenv("CORS_ORIGIN_REGEX") or "").strip() or None
+CORS_ORIGIN_REGEX = (os.getenv("CORS_ORIGIN_REGEX") or "https://.*\\.vercel\\.app").strip() or None
 if CORS_ORIGINS_RAW:
     CORS_ALLOW_ORIGINS = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
 else:
