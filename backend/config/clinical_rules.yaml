@@ -1,14 +1,111 @@
+version: "0.2"
+meta:
+  description: "Scaffolded clinical rules with severity tiers and coverage for common primary-care labs/symptoms."
+  last_updated: "2025-01-01"
+  notes: "Values are placeholders; validate against current guidelines before production use."
+
+triage:
+  levels:
+    low: "No urgent findings; reinforce lifestyle and monitoring."
+    moderate: "Non-emergent but warrants clinician follow-up."
+    high: "Likely needs same-day clinician attention."
+    emergent: "Red-flag finding; advise immediate evaluation."
+
 glucose:
+  # Legacy key retained for compatibility with existing code paths
   very_high_mg_dl: 200
+  thresholds:
+    impaired_fasting_mg_dl: 110
+    mild_high_mg_dl: 140
+    high_mg_dl: 180
+    critical_mg_dl: 250
+
 lipids:
   ldl:
+    # Legacy key retained for compatibility
     elevated_mg_dl: 160
+    thresholds:
+      borderline_mg_dl: 130
+      high_mg_dl: 160
+      very_high_mg_dl: 190
   hdl:
+    # Legacy key retained for compatibility
     low_mg_dl: 40
+    thresholds:
+      low_mg_dl: 40
+  triglycerides:
+    thresholds:
+      moderate_mg_dl: 200
+      high_mg_dl: 500
+
 obesity:
   bmi_threshold: 30
+  severe_bmi_threshold: 35
+
+blood_pressure:
+  systolic_mm_hg:
+    elevated: 120
+    stage1: 130
+    stage2: 140
+    crisis: 180
+  diastolic_mm_hg:
+    stage1: 80
+    stage2: 90
+    crisis: 120
+
+renal:
+  egfr_ml_min_1_73m2:
+    mild_ckd: 60
+    moderate_ckd: 45
+    severe_ckd: 30
+  creatinine_mg_dl:
+    upper_normal: 1.3
+    critical: 2.0
+
+hematology:
+  hemoglobin_g_dl:
+    low_male: 13.0
+    low_female: 12.0
+    critical: 8.0
+  wbc_10e3_uL:
+    low: 3.0
+    high: 11.0
+    critical_high: 20.0
+  platelets_10e3_uL:
+    low: 150
+    high: 450
+    critical_low: 50
+
+inflammatory:
+  crp_mg_L:
+    mild: 10
+    high: 30
+  esr_mm_hr:
+    elevated: 30
+
+cardiac:
+  troponin_ng_ml:
+    elevated: 0.04
+    critical: 0.1
+
 symptoms:
   red_flags:
     - "chest pain"
     - "shortness of breath"
     - "dizziness"
+    - "syncope"
+    - "hemoptysis"
+    - "acute weakness"
+    - "confusion"
+    - "severe abdominal pain"
+    - "vision loss"
+  moderate_flags:
+    - "palpitations"
+    - "edema"
+    - "persistent fever"
+    - "weight loss"
+    - "night sweats"
+  duration_modifiers:
+    acute_days: 3
+    subacute_days: 14
+    chronic_days: 30

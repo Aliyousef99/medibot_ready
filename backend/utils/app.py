@@ -2,6 +2,7 @@ from typing import Any, Optional, Tuple
 import os
 import json
 from sqlalchemy.orm import Session
+from sqlalchemy import cast, Text as SAText
 from backend.models.lab_report import LabReport
 from backend.models.user import User, UserProfile
 from backend.models.symptom_event import SymptomEvent
@@ -36,7 +37,12 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
 
     Returns (context_text, notice_if_truncated)
     """
-    profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
+    # Ensure clean transaction before queries
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    profile = db.query(UserProfile).filter(cast(UserProfile.user_id, SAText) == str(user.id)).first()
     profile_str = _profile_lines(profile) 
     # Latest lab report (structured) — allow override from request context
     if structured_override is not None:
@@ -44,7 +50,7 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
     else:
         lab = (
             db.query(LabReport)
-            .filter(LabReport.user_id == str(user.id))
+            .filter(cast(LabReport.user_id, SAText) == str(user.id))
             .order_by(LabReport.created_at.desc())
             .first() 
         )
@@ -54,7 +60,7 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
     # Latest symptom event (optional)
     sym = (
         db.query(SymptomEvent)
-        .filter(SymptomEvent.user_id == user.id)
+        .filter(cast(SymptomEvent.user_id, SAText) == str(user.id))
         .order_by(SymptomEvent.created_at.desc())
         .first()
     )

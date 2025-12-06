@@ -3,6 +3,7 @@
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
+from sqlalchemy import cast, Text as SAText
 
 from backend.db.session import get_db
 from backend.models.user import User
@@ -16,6 +17,11 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     """Resolve the authenticated user from the Authorization bearer token."""
+    # Ensure the session isn't left in aborted state from prior work
+    try:
+        db.rollback()
+    except Exception:
+        pass
     print(f"Credentials: {credentials}")
     if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(
@@ -42,7 +48,8 @@ def get_current_user(
     if isinstance(subject, str) and "@" in subject:
         user = qry.filter(User.email == subject).first()
     else:
-        user = qry.filter(User.id == str(subject)).first()
+        # Cast column to text to avoid UUID vs varchar mismatches on legacy schemas
+        user = qry.filter(cast(User.id, SAText) == str(subject)).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

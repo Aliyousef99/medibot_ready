@@ -8,6 +8,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+# Ensure JSON columns use generic JSON (not JSONB) under SQLite
+os.environ.setdefault("FORCE_GENERIC_JSON", "1")
+
 from backend.app import app
 from backend.db.session import Base, get_db
 from backend.auth.deps import get_current_user

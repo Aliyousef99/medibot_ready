@@ -1,3 +1,9 @@
+"""Legacy chat endpoints (start/send/history).
+
+These are kept for reference but are no longer mounted by default; the
+primary chat entrypoint lives in backend/app.py:/api/chat.
+"""
+
 from __future__ import annotations
 
 import json

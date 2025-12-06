@@ -46,6 +46,33 @@ cp .env.example .env
 uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+**Docker (backend only)**
+
+```
+docker build -f backend/Dockerfile -t medibot-backend ./backend
+docker run -p 8000:8000 \
+  -e DATABASE_URL=postgresql+psycopg2://medibot:medibot@db:5432/medibot \
+  -e REDIS_URL=redis://redis:6379/0 \
+  medibot-backend
+```
+
+**Migrations (Alembic)**
+
+```
+cd backend
+alembic upgrade head        # apply migrations
+alembic revision --autogenerate -m "describe change"  # create new migration when models change
+```
+
+**Using Supabase (managed Postgres)**
+
+1) In Supabase Dashboard → Settings → Database, copy the Python connection string and append `?sslmode=require` if it’s missing. Example:
+```
+DATABASE_URL=postgresql+psycopg2://postgres:<password>@<project>.supabase.co:5432/postgres?sslmode=require
+```
+2) Export that as `DATABASE_URL` (PowerShell: `$env:DATABASE_URL="..."`) before running the app or migrations.
+3) Apply migrations: `python -m alembic upgrade head` from `backend/` with the venv active.
+
 ### 2) Frontend
 
 ```bash
@@ -80,10 +107,13 @@ BIOBERT_MODEL_NAME=d4data/biobert_ner
 NER_FALLBACK_MODEL=dslim/bert-base-NER
 DEMO_USER_EMAIL=demo@example.com   # auto-seeded on startup
 DEMO_USER_PASSWORD=demo123
-DATABASE_URL=sqlite:///./medibot.db # defaults to SQLite; point to Postgres via URL
+DATABASE_URL=postgresql+psycopg2://medibot:medibot@localhost:5432/medibot # set to SQLite for local quickstart if preferred
+SQL_ECHO=false
+REDIS_URL=redis://localhost:6379/0
+REDIS_PREFIX=medibot
 ```
 
-- **Gemini** used: REST call to `generateContent` (2.5‑flash by default; adjust as you wish).
+- **Gemini** used: REST call to `generateContent` (2.5-flash by default; adjust as you wish).
 - **Tesseract OCR**: Make sure **Tesseract** is installed on your machine and available on PATH for OCR to work.
   - Windows: https://github.com/UB-Mannheim/tesseract/wiki
   - macOS: `brew install tesseract`
@@ -95,7 +125,7 @@ If Tesseract or PDF text extraction isn't available, the endpoint will return an
 
 ## ## Local Database & Demo User
 
-- The backend defaults to a local SQLite file (`medibot.db`) with `check_same_thread=False` for multi-threaded use. Override via `DATABASE_URL` for Postgres or another RDBMS.
+- The backend now targets Postgres by default via `DATABASE_URL`. You can still point to SQLite for quick dev by setting `DATABASE_URL=sqlite:///./medibot.db` (with `check_same_thread=False` automatically set).
 - On startup, the backend seeds a demo user using the env vars above. Adjust or disable by clearing `DEMO_USER_EMAIL`/`DEMO_USER_PASSWORD`.
 - Password hashing upgraded to PBKDF2 (with fallback to bcrypt/plaintext for legacy records). Existing user rows continue to work; new ones get PBKDF2 hashes automatically.
 

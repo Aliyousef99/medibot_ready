@@ -7,7 +7,9 @@ import {
   deleteHistory,
   LabReport,
 } from '../services/api';
-import { Eye, Trash2, X, Loader2, AlertCircle, CheckCircle2, TriangleAlert, Info } from 'lucide-react';
+import { Eye, Trash2, X, Loader2, AlertCircle, CheckCircle2, TriangleAlert, Info, RefreshCw } from 'lucide-react';
+import { useToastStore } from '../state/toastStore';
+import { handleApiError } from '../services/api';
 
 const HistoryPage: React.FC = () => {
   const [labs, setLabs] = useState<LabReport[]>([]);
@@ -17,20 +19,23 @@ const HistoryPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const toast = useToastStore();
+
+  const fetchHistory = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await getHistory();
+      setLabs(data);
+    } catch (err: any) {
+      handleApiError(err);
+      setError(`Failed to fetch lab history: ${err.message || "Network error"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    const fetchHistory = async () => {
-      setLoading(true);
-      try {
-        const data = await getHistory();
-        setLabs(data);
-      } catch (err: any) {
-        setError(`Failed to fetch lab history: ${err.message}`);
-      } finally {
-        setLoading(false);
-      }
-    };
-
     fetchHistory();
   }, []);
 
@@ -41,7 +46,8 @@ const HistoryPage: React.FC = () => {
       const data = await getHistoryDetail(labId);
       setSelectedLab(data);
     } catch (err: any) {
-      setError(`Failed to fetch lab details: ${err.message}`);
+      handleApiError(err);
+      setError(`Failed to fetch lab details: ${err.message || "Network error"}`);
     } finally {
       setDetailLoading(false);
     }
@@ -56,7 +62,8 @@ const HistoryPage: React.FC = () => {
       setLabs(labs.filter((lab) => lab.id !== labToDelete));
       setLabToDelete(null); // Close confirmation dialog
     } catch (err: any) {
-      setError(`Failed to delete lab report: ${err.message}`);
+      handleApiError(err);
+      setError(`Failed to delete lab report: ${err.message || "Network error"}`);
     } finally {
       setDeleting(false);
     }
@@ -79,15 +86,29 @@ const HistoryPage: React.FC = () => {
         <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
           <strong className="font-bold">Error: </strong>
           <span className="block sm:inline">{error}</span>
-          <span className="absolute top-0 bottom-0 right-0 px-4 py-3" onClick={() => setError(null)}>
-            <X className="h-6 w-6 text-red-500" />
-          </span>
+          <div className="absolute top-0 bottom-0 right-0 flex items-center gap-2 px-4 py-3">
+            <button
+              className="text-xs px-2 py-1 rounded border border-red-300 hover:bg-red-50"
+              onClick={fetchHistory}
+            >
+              Retry
+            </button>
+            <button onClick={() => setError(null)} aria-label="Dismiss error">
+              <X className="h-6 w-6 text-red-500" />
+            </button>
+          </div>
         </div>
       )}
 
       {labs.length === 0 && !loading ? (
         <div className="text-center py-12">
           <p className="text-gray-500">You have no saved lab reports yet.</p>
+          <button
+            onClick={fetchHistory}
+            className="mt-3 inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-300 hover:bg-zinc-100"
+          >
+            <RefreshCw className="w-4 h-4" /> Refresh
+          </button>
         </div>
       ) : (
         <div className="space-y-4">

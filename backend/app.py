@@ -2,10 +2,13 @@
 import os, io, json, base64, re
 import pytesseract, httpx
 import sys
+import shutil
 
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
+from redis import Redis
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Text as SAText
+from sqlalchemy import func, cast, Text as SAText, text as SAtext
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -32,7 +35,6 @@ from backend.models.user import User, UserProfile
 from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
-from backend.routes import chat_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
 from backend.services.recommendations import recommend, red_flag_triage, lab_triage
@@ -45,6 +47,20 @@ GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
 HUGGINGFACE_TOKEN = (os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACE_API_KEY") or "").strip()
 BIOBERT_MODEL_NAME = os.getenv("BIOBERT_MODEL_NAME", "d4data/biobert_ner").strip() or "d4data/biobert_ner"
 AI_EXPLANATION_ENABLED = (os.getenv("AI_EXPLANATION_ENABLED", "true") or "true").strip().lower() not in {"0","false","off","no"}
+REDIS_URL = (os.getenv("REDIS_URL") or "redis://localhost:6379/0").strip()
+REDIS_PREFIX = (os.getenv("REDIS_PREFIX") or "medibot").strip()
+NER_MODEL_NAME = (os.getenv("NER_MODEL_NAME") or BIOBERT_MODEL_NAME).strip() or BIOBERT_MODEL_NAME
+NER_DEVICE = (os.getenv("NER_DEVICE") or "auto").strip().lower()  # "auto" | "cpu" | "cuda" | gpu index
+NER_MAX_CHARS = int(os.getenv("NER_MAX_CHARS") or 4000)
+NER_TIMEOUT_SECONDS = float(os.getenv("NER_TIMEOUT_SECONDS") or 8.0)
+CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS")
+if CORS_ORIGINS_RAW:
+    CORS_ALLOW_ORIGINS = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
+else:
+    CORS_ALLOW_ORIGINS = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
 app = FastAPI(title="MediBot Backend", version="0.1.0")
 router = APIRouter(prefix="/api")
@@ -124,36 +140,29 @@ except Exception:
 import time
 from fastapi import Request as _FastAPIRequest
 
-# ---- Simple latest-lab cache (TTL 15 min) ----
-if not hasattr(app.state, "latest_lab_cache"):
-    app.state.latest_lab_cache = {}  # type: ignore[attr-defined]
-
+# ---- Redis-backed cache (TTL 15 min) ----
 LAB_CACHE_TTL_SECONDS = 15 * 60
 
 def set_latest_lab_cache(user_id: str, structured: Dict[str, Any]) -> None:
+    client = get_redis_client()
+    if not client:
+        return
     try:
-        app.state.latest_lab_cache[user_id] = {  # type: ignore[attr-defined]
-            "ts": time.time(),
-            "data": structured,
-        }
-    except Exception:
-        pass
+        client.setex(f"{REDIS_PREFIX}:latest_lab:{user_id}", LAB_CACHE_TTL_SECONDS, json.dumps(structured))
+    except Exception as exc:
+        logger.debug("set_latest_lab_cache failed", extra={"error": str(exc)})
 
 def get_latest_lab_cache(user_id: str) -> Optional[Dict[str, Any]]:
+    client = get_redis_client()
+    if not client:
+        return None
     try:
-        entry = app.state.latest_lab_cache.get(user_id)  # type: ignore[attr-defined]
-        if not entry:
+        raw = client.get(f"{REDIS_PREFIX}:latest_lab:{user_id}")
+        if not raw:
             return None
-        if time.time() - float(entry.get("ts", 0)) > LAB_CACHE_TTL_SECONDS:
-            # expired
-            try:
-                del app.state.latest_lab_cache[user_id]  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            return None
-        data = entry.get("data")
-        return data if isinstance(data, dict) else None
-    except Exception:
+        return json.loads(raw)
+    except Exception as exc:
+        logger.debug("get_latest_lab_cache failed", extra={"error": str(exc)})
         return None
 
 def user_rate_key(request: _FastAPIRequest) -> str:
@@ -192,6 +201,34 @@ if 'RateLimitExceeded' in globals():
             },
         )
 
+def _init_redis():
+    try:
+        app.state.redis_client = Redis.from_url(REDIS_URL, decode_responses=True)  # type: ignore[attr-defined]
+        app.state.redis_client.ping()  # type: ignore[attr-defined]
+    except Exception as exc:
+        app.state.redis_client = None  # type: ignore[attr-defined]
+        logger.warning("Redis unavailable; falling back to no-cache mode", extra={"error": str(exc)})
+
+def get_redis_client() -> Optional[Redis]:
+    try:
+        return getattr(app.state, "redis_client", None)
+    except Exception:
+        return None
+
+
+def _verify_tesseract_available() -> None:
+    """Fail fast if Tesseract is missing or unusable."""
+    binary = shutil.which("tesseract")
+    if not binary:
+        raise RuntimeError(
+            "Tesseract OCR binary not found. Install it (e.g., apt-get install tesseract-ocr) "
+            "or run via the provided Dockerfile where it is preinstalled."
+        )
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError(f"Tesseract found at {binary} but unusable: {exc}")
+
 
 def _maybe_seed_demo_user() -> None:
     email = (os.getenv("DEMO_USER_EMAIL", "demo@example.com") or "").strip()
@@ -221,15 +258,18 @@ def _maybe_seed_demo_user() -> None:
 
 @app.on_event("startup")
 def _init_db():
-    init_db()
+    _verify_tesseract_available()
+    try:
+        init_db()
+    except Exception as exc:  # pragma: no cover - environment specific
+        logger.error("Database initialization failed. Check DATABASE_URL (current: %s)", os.getenv("DATABASE_URL", "unset"))
+        raise
+    _init_redis()
     _maybe_seed_demo_user()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=CORS_ALLOW_ORIGINS if "*" not in CORS_ALLOW_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -240,8 +280,45 @@ app.include_router(auth_routes.router)
 app.include_router(history_routes.router)
 app.include_router(profile_router)   # profile PUT/GET live here
 app.include_router(symptoms_routes.router)
-app.include_router(chat_routes.router)
 app.include_router(recs_routes.router, prefix="/api/recommendations")
+
+# --- health check ---
+@app.get("/health")
+def health_check():
+    db_ok = False
+    redis_ok = False
+    model_ok = False
+    model_warning: Optional[str] = None
+    try:
+        with SessionLocal() as db:
+            db.execute(SAtext("SELECT 1"))
+            db_ok = True
+    except Exception as exc:
+        logger.warning("healthcheck_db_failed", extra={"error": str(exc)})
+
+    client = get_redis_client()
+    if client:
+        try:
+            client.ping()
+            redis_ok = True
+        except Exception as exc:
+            logger.warning("healthcheck_redis_failed", extra={"error": str(exc)})
+
+    pipe, model_name, warn = get_ner_pipeline()
+    model_ok = pipe is not None
+    model_warning = warn
+
+    status = "ok" if db_ok and redis_ok and model_ok else "degraded"
+    return {
+        "status": status,
+        "db": db_ok,
+        "redis": redis_ok,
+        "ner": {
+            "available": model_ok,
+            "model": model_name,
+            "warning": model_warning,
+        },
+    }
 
 # --- schemas ---
 class ParseRequest(BaseModel):
@@ -375,7 +452,9 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
 
     if pipeline is not None:
         try:
-            entities_raw = pipeline(text)  # type: ignore[operator]
+            # Enforce max length to avoid oversized inputs
+            ner_input = text[:NER_MAX_CHARS]
+            entities_raw = _run_ner_with_timeout(pipeline, ner_input, timeout=NER_TIMEOUT_SECONDS)
             entities_formatted = format_entities(entities_raw)
         except Exception as err:  # pragma: no cover - runtime inference issues
             ner_error = f"NER inference failed: {err}"
@@ -487,15 +566,95 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
     return out
 # -------------------- Routes --------------------
 
-def get_ner_pipeline():
-    # This function can be expanded to select models based on availability or other criteria
-    # For now, it's a placeholder for where such logic would go.
-    # In a real app, you might check for GPU availability, model versions, etc.
-    return None, "placeholder_model", "NER pipeline not available"
+NER_FALLBACK_MODEL_NAME = (os.getenv("NER_FALLBACK_MODEL") or "dslim/bert-base-NER").strip() or "dslim/bert-base-NER"
 
-def format_entities(entities):
-    # Placeholder for formatting raw NER output
-    return entities
+def _resolve_device() -> int:
+    if NER_DEVICE == "cpu":
+        return -1
+    if NER_DEVICE == "cuda":
+        try:
+            import torch  # type: ignore
+            return 0 if torch.cuda.is_available() else -1
+        except Exception:
+            return -1
+    try:
+        # explicit GPU index
+        if NER_DEVICE.isdigit():
+            return int(NER_DEVICE)
+    except Exception:
+        pass
+    # auto: prefer GPU if available
+    try:
+        import torch  # type: ignore
+        return 0 if torch.cuda.is_available() else -1
+    except Exception:
+        return -1
+
+@lru_cache(maxsize=1)
+def _load_ner_pipeline():
+    """Lazy-load BioBERT with a lightweight fallback model."""
+    try:
+        from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline as hf_pipeline  # type: ignore
+    except Exception as exc:  # pragma: no cover - import errors depend on env
+        return None, BIOBERT_MODEL_NAME, f"transformers unavailable: {exc}"
+
+    auth_token = HUGGINGFACE_TOKEN or None
+
+    def _build(model_name: str):
+        return hf_pipeline(
+            "ner",
+            model=AutoModelForTokenClassification.from_pretrained(model_name, token=auth_token),
+            tokenizer=AutoTokenizer.from_pretrained(model_name, token=auth_token),
+            aggregation_strategy="simple",
+            device=_resolve_device(),
+        )
+
+    init_warning: Optional[str] = None
+    try:
+        pipe = _build(NER_MODEL_NAME)
+        return pipe, NER_MODEL_NAME, None
+    except Exception as exc:  # pragma: no cover - depends on external HF availability
+        init_warning = f"BioBERT unavailable: {exc}"
+        try:
+            pipe = _build(NER_FALLBACK_MODEL_NAME)
+            return pipe, NER_FALLBACK_MODEL_NAME, init_warning
+        except Exception as exc_fallback:
+            warning = f"{init_warning}; fallback failed: {exc_fallback}"
+            return None, NER_FALLBACK_MODEL_NAME, warning
+
+def get_ner_pipeline():
+    # Return (pipeline, model_name, warning_message)
+    return _load_ner_pipeline()
+
+def format_entities(predictions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    formatted: List[Dict[str, Any]] = []
+    for item in predictions or []:
+        term = item.get("word") or item.get("text") or ""
+        if not term:
+            continue
+        formatted.append(
+            {
+                "term": term,
+                "start": item.get("start"),
+                "end": item.get("end"),
+                "score": float(item.get("score", 0.0)),
+                "label": item.get("entity_group") or item.get("entity") or "ENTITY",
+            }
+        )
+    return formatted
+
+def _run_ner_with_timeout(pipe, input_text: str, timeout: float) -> List[Dict[str, Any]]:
+    """Run pipeline with a hard timeout to avoid blocking workers."""
+    try:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            fut = executor.submit(pipe, input_text)
+            return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(f"NER inference exceeded {timeout} seconds")
+    except Exception:
+        raise
 
 def _line_spans(text: str) -> List[Tuple[str, int, int]]:
     spans: List[Tuple[str, int, int]] = []
@@ -733,26 +892,157 @@ def _parse_lab_text_heuristic(text: str) -> Dict[str, Any]:
     }
 
 def extract_tests_from_entities(text: str, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # This is a placeholder for a more sophisticated entity extraction logic.
-    # For now, we'll just return an empty list as the NER service is being removed.
-    return []
+    if not entities:
+        return []
 
-NER_LAB_LABELS = set() # Placeholder
-VALUE_UNIT_INLINE = re.compile(r'.*') # Placeholder
+    tests: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    lines = _line_spans(text)
+
+    for ent in entities:
+        term = (ent.get("term") or ent.get("word") or ent.get("text") or "").strip()
+        if not term:
+            continue
+        label = normalize_entity_label(ent.get("label") or ent.get("entity_group") or ent.get("entity") or "")
+        if label and label not in NER_LAB_LABELS:
+            continue
+        start = ent.get("start")
+        if start is None:
+            continue
+        try:
+            start_idx = int(start)
+        except Exception:
+            continue
+
+        line_ctx: Optional[Tuple[str, int, int]] = None
+        for line, s, e in lines:
+            if s <= start_idx < e:
+                line_ctx = (line, s, e)
+                break
+        if not line_ctx:
+            continue
+
+        line_text, s, _e = line_ctx
+        candidate = parse_line_into_test(line_text, preferred_name=term)
+        if not candidate:
+            candidate = _naive_test_from_line(line_text, term, start_idx - s)
+        if not candidate:
+            continue
+
+        try:
+            candidate["value"] = float(str(candidate.get("value")))
+        except Exception:
+            pass
+
+        key = (candidate["name"].lower(), str(candidate["value"]), candidate.get("unit", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        candidate["source"] = candidate.get("source") or "ner-aligned"
+        tests.append(candidate)
+
+    return tests
+
+NER_LAB_LABELS = {
+    "CHEMICAL",
+    "CHEM",
+    "TEST",
+    "LAB",
+    "LAB_TEST",
+    "DISEASE",
+    "PROBLEM",
+    "SYMPTOM",
+    "SIGN",
+    "TREATMENT",
+    "MEDICATION",
+    "ANATOMY",
+    "BODY",
+    "CELL",
+    "PROTEIN",
+    "DNA",
+    "RNA",
+    "PER",
+    "ORG",
+    "LOC",
+    "MISC",
+    "ENTITY",
+}
+VALUE_UNIT_INLINE = re.compile(
+    r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(?P<flag>[HhLl])?(?:\s*(?P<unit>%|[A-Za-z\u00B5\u03BC\u00B5/%][A-Za-z0-9\u00B5\u03BC/%\^]*))?"
+)
 
 def normalize_entity_label(label: str) -> str:
-    # Placeholder
-    return label
+    cleaned = (label or "").strip()
+    cleaned = re.sub(r"^[BIO]-", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.replace("_", "-").upper()
 
 def _select_value_match(segment: str, from_start: bool = True) -> Optional[re.Match]:
-    # Placeholder
-    return None
+    matches = list(VALUE_UNIT_INLINE.finditer(segment))
+    if not matches:
+        return None
+    return matches[0] if from_start else matches[-1]
 
 def _naive_test_from_line(line: str, name: str, entity_offset: int) -> Optional[Dict[str, Any]]:
-    # Placeholder
-    return None
+    raw = line.strip()
+    if not raw or not name:
+        return None
+    rel = max(0, min(len(raw), entity_offset))
+    after = raw[rel:]
+    before = raw[:rel]
+    match = _select_value_match(after, from_start=True) or _select_value_match(before, from_start=False)
+    if not match:
+        return None
 
-NER_FALLBACK_MODEL_NAME = "placeholder_fallback_model"
+    value_txt = (match.group("value") or "").replace(",", "")
+    try:
+        value_num = float(value_txt)
+    except Exception:
+        return None
+
+    unit = normalize_unit_text((match.group("unit") or "").replace(" ", ""))
+    flag = (match.group("flag") or "").upper()
+    status = "high" if flag == "H" else "low" if flag == "L" else None
+    status = status or detect_status(raw) or "unspecified"
+
+    ref = parse_bracket_range(raw)
+    ref_min = ref_max = None
+    if ref:
+        if ref.get("unit"):
+            unit = normalize_unit_text(ref.get("unit")) or unit
+        inferred = compare_to_range(value_num, ref)
+        if inferred:
+            status = inferred
+        kind = ref.get("kind")
+        if kind == "between":
+            ref_min = ref.get("lo")
+            ref_max = ref.get("hi")
+        elif kind in ("lt", "lte"):
+            ref_max = ref.get("v")
+        elif kind in ("gt", "gte"):
+            ref_min = ref.get("v")
+
+    canon = name.strip()
+    canon_low = canon.lower().replace(" ", "")
+    if "cholesteroltotal" in canon_low:
+        canon = "Cholesterol Total"
+    elif canon_low.startswith("triglyceride"):
+        canon = "Triglyceride"
+
+    abnormal = status if status in ("high", "low", "normal") else "unknown"
+    conf = 0.6 + (0.2 if unit else 0.0) + (0.1 if ref else 0.0)
+
+    return {
+        "name": canon,
+        "value": value_num,
+        "unit": unit,
+        "status": status,
+        "reference": ref or None,
+        "ref_min": ref_min,
+        "ref_max": ref_max,
+        "abnormal": abnormal,
+        "evidence": raw,
+        "confidence": round(min(conf, 0.95), 2),
+    }
 
 
 @app.post("/api/parse_lab")
@@ -777,7 +1067,7 @@ def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db)
             # simple dedupe: if last lab for user has identical structured_json, reuse it
             lr = (
                 db.query(LabReport)
-                .filter(LabReport.user_id == str(user.id))
+                .filter(cast(LabReport.user_id, SAText) == str(user.id))
                 .order_by(LabReport.created_at.desc())
                 .first()
             )
@@ -886,29 +1176,42 @@ async def list_models(request: Request):
             logger.error("list_models failed")
             raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
 
-# ---- Simple per-user chat history (in-memory) ----
-if not hasattr(app.state, "chat_history_store"):
-    app.state.chat_history_store = {}  # type: ignore[attr-defined]
-
+# ---- Per-user chat history via Redis ----
 MAX_CHAT_HISTORY = 50  # keep last 50 turns (user/assistant messages)
 
 def append_chat_history(user_id: str, role: str, content: str) -> None:
+    client = get_redis_client()
+    if not client:
+        return
+    payload = json.dumps({"role": role, "content": content})
+    key = f"{REDIS_PREFIX}:chat_history:{user_id}"
     try:
-        store = app.state.chat_history_store  # type: ignore[attr-defined]
-        bucket = store.setdefault(user_id, [])
-        bucket.append({"role": role, "content": content})
-        # trim oldest beyond limit
-        if len(bucket) > MAX_CHAT_HISTORY:
-            del bucket[: len(bucket) - MAX_CHAT_HISTORY]
-    except Exception:
-        pass
+        pipe = client.pipeline()
+        pipe.rpush(key, payload)
+        pipe.ltrim(key, -MAX_CHAT_HISTORY, -1)
+        pipe.expire(key, LAB_CACHE_TTL_SECONDS)
+        pipe.execute()
+    except Exception as exc:
+        logger.debug("append_chat_history failed", extra={"error": str(exc)})
 
 def get_chat_history(user_id: str):
+    client = get_redis_client()
+    if not client:
+        return []
+    key = f"{REDIS_PREFIX}:chat_history:{user_id}"
     try:
-        store = app.state.chat_history_store  # type: ignore[attr-defined]
-        hist = store.get(user_id) or []
-        return hist if isinstance(hist, list) else []
-    except Exception:
+        raw_items = client.lrange(key, -MAX_CHAT_HISTORY, -1)
+        history = []
+        for item in raw_items:
+            try:
+                parsed = json.loads(item)
+                if isinstance(parsed, dict) and "role" in parsed and "content" in parsed:
+                    history.append(parsed)
+            except Exception:
+                continue
+        return history
+    except Exception as exc:
+        logger.debug("get_chat_history failed", extra={"error": str(exc)})
         return []
 
 
@@ -925,6 +1228,11 @@ async def chat(
     # Record user id on request state for per-user rate limiting
     try:
         request.state.user_id = str(user.id)
+    except Exception:
+        pass
+    # Ensure DB session is clean before we start work (in case a prior request aborted)
+    try:
+        db.rollback()
     except Exception:
         pass
     from backend.utils.app import build_chat_context
@@ -1255,7 +1563,7 @@ async def chat(
                 candidates = (
                     db.query(LabReport)
                     .filter(
-                        LabReport.user_id == str(user.id),
+                        cast(LabReport.user_id, SAText) == str(user.id),
                         LabReport.structured_json.isnot(None),
                         func.length(trimmed) > 2,
                         trimmed.notin_(['{}', 'null', ''])
@@ -1910,12 +2218,37 @@ def _sanitize_filename(name: str) -> str:
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "10"))
 
 
+@app.get("/api/extract_text")
+async def extract_text_info():
+    """
+    Friendly helper for accidental GET requests. The extractor only supports POST with multipart/form-data.
+    """
+    return {
+        "detail": "Use POST multipart/form-data with `file` (PDF or image).",
+        "max_file_mb": MAX_FILE_MB,
+        "supported_types": ["application/pdf", "image/*"],
+    }
+
+
 @app.post("/api/extract_text")
 @limiter.limit("10/minute", key_func=user_rate_key)
 async def extract_text(request: Request, file: UploadFile = File(...), user: User = Depends(get_current_user)):
     # Record user id on request state for per-user rate limiting
     try:
         request.state.user_id = str(user.id)
+    except Exception:
+        pass
+    try:
+        logger.info(
+            json.dumps(
+                {
+                    "event": "extract_text_received",
+                    "filename": (file.filename or "").strip() or "unnamed",
+                    "content_type": (file.content_type or "").lower(),
+                    "user": getattr(user, "email", None),
+                }
+            )
+        )
     except Exception:
         pass
     # Read into memory; never write to disk
@@ -1944,7 +2277,25 @@ async def extract_text(request: Request, file: UploadFile = File(...), user: Use
                 raise ValueError("No text found in PDF")
             return {"text": joined}
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF extraction failed: {e}")
+            # Fallback to OCR if PDF text is empty or parsing failed
+            try:
+                images = []
+                try:
+                    from pdf2image import convert_from_bytes  # type: ignore
+                    images = convert_from_bytes(data)
+                except Exception:
+                    images = []
+                if not images:
+                    raise e
+                ocr_text = []
+                for img in images:
+                    ocr_text.append(pytesseract.image_to_string(img, lang="eng"))
+                joined = "\n".join(ocr_text).strip()
+                if not joined:
+                    raise ValueError("No text found via OCR")
+                return {"text": joined, "source": "pdf_ocr_fallback"}
+            except Exception as ocr_exc:
+                raise HTTPException(status_code=400, detail=f"PDF extraction failed: {e}; OCR fallback failed: {ocr_exc}")
 
     # Image OCR path
     try:

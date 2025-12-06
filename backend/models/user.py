@@ -19,15 +19,8 @@ from backend.db.session import Base, engine
 
 # ---- Dialect-aware column types ----
 
-# UUID column type: Postgres gets native UUID, others get String(36)
-try:
-    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-except Exception:
-    PG_UUID = None  # not available
-
+# UUID column type: normalize to String(36) to match existing schema (avoid UUID/varchar mismatches)
 def uuid_col_type():
-    if engine.dialect.name == "postgresql" and PG_UUID is not None:
-        return PG_UUID(as_uuid=True)
     return String(36)
 
 # JSON column type: Postgres gets JSONB, others get generic JSON
@@ -37,6 +30,9 @@ except Exception:
     PG_JSONB = None
 
 def json_col_type():
+    # In tests or non-Postgres environments, force generic JSON to avoid JSONB with SQLite
+    if os.getenv("FORCE_GENERIC_JSON", "").lower() in ("1", "true", "yes"):
+        return SA_JSON
     if engine.dialect.name == "postgresql" and PG_JSONB is not None:
         return PG_JSONB
     return SA_JSON

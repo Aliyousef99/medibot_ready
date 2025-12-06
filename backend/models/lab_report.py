@@ -27,6 +27,9 @@ except Exception:
     PG_JSONB = None
 
 def json_col_type():
+    import os
+    if os.getenv("FORCE_GENERIC_JSON", "").lower() in ("1", "true", "yes"):
+        return SA_JSON
     if engine.dialect.name == "postgresql" and PG_JSONB is not None:
         return PG_JSONB
     return SA_JSON

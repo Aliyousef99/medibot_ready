@@ -1,32 +1,28 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
+import { Navigate, Route, Routes, Link } from 'react-router-dom';
 import ClassicChatbotUI from './components/ClassicChatbotUI';
 import HistoryPage from './pages/History';
+import ToastHost from './components/ToastHost';
+import { ProtectedRoute } from './components/ProtectedRoute';
 
 const App: React.FC = () => {
-  const [path, setPath] = useState(window.location.hash);
-
-  useEffect(() => {
-    const handleHashChange = () => {
-      setPath(window.location.hash);
-    };
-
-    window.addEventListener('hashchange', handleHashChange);
-
-    return () => {
-      window.removeEventListener('hashchange', handleHashChange);
-    };
-  }, []);
-
-  const renderPage = () => {
-    switch (path) {
-      case '#/history':
-        return <HistoryPageWithHeader />;
-      default:
-        return <ClassicChatbotUI />;
-    }
-  };
-
-  return renderPage();
+  return (
+    <>
+      <Routes>
+        <Route path="/" element={<ClassicChatbotUI />} />
+        <Route
+          path="/history"
+          element={
+            <ProtectedRoute>
+              <HistoryPageWithHeader />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+      <ToastHost />
+    </>
+  );
 };
 
 // Wrapper for HistoryPage to include a header with a link back to the chat
@@ -34,9 +30,9 @@ const HistoryPageWithHeader: React.FC = () => {
   return (
     <div>
       <header className="p-4 bg-gray-100 border-b">
-        <a href="#/" className="text-blue-500 hover:underline">
+        <Link to="/" className="text-blue-500 hover:underline">
           &larr; Back to Chat
-        </a>
+        </Link>
       </header>
       <HistoryPage />
     </div>

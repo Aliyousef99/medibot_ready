@@ -1,6 +1,7 @@
 # backend/routes/profile.py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import cast, Text as SAText
 from backend.db.session import get_db
 from backend.auth.deps import get_current_user
 from backend.models.user import User, UserProfile
@@ -13,7 +14,11 @@ def get_profile(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    prof = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    prof = db.query(UserProfile).filter(cast(UserProfile.user_id, SAText) == str(user.id)).first()
     if not prof:
         # create an empty profile on first read (optional, but handy)
         prof = UserProfile(user_id=user.id)
@@ -28,7 +33,11 @@ def upsert_profile(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    prof = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    prof = db.query(UserProfile).filter(cast(UserProfile.user_id, SAText) == str(user.id)).first()
     if not prof:
         prof = UserProfile(user_id=user.id)
 

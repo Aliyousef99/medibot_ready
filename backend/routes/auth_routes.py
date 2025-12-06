@@ -1,5 +1,6 @@
 # backend/routes/auth_routes.py
-from fastapi import APIRouter, Depends, HTTPException, Body, status
+from fastapi import APIRouter, Depends, HTTPException, Body, status, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, constr
 from backend.db.session import get_db
@@ -48,3 +49,38 @@ def register(payload: RegisterIn = Body(...), db: Session = Depends(get_db)):
     db.commit()
     # No token returned here; the UI performs a separate login call.
     return {"status": "created"}
+
+
+# ---- Email verification scaffold (placeholder) ----
+class VerifyRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/request_verification", status_code=status.HTTP_202_ACCEPTED)
+def request_verification(payload: VerifyRequest):
+    """Stub endpoint for requesting a verification email."""
+    # In a production setup, enqueue email with a signed token here.
+    return {"status": "queued", "message": "Verification email flow not yet implemented."}
+
+
+@router.get("/verify_email")
+def verify_email(token: str):
+    """Stub endpoint for verifying an email token."""
+    # In a production setup, decode token and mark user as verified.
+    return {"status": "pending", "message": "Email verification is not yet implemented.", "token": token}
+
+
+# ---- Google OAuth stubs ----
+@router.get("/google/start")
+def google_oauth_start(request: Request):
+    """Return a placeholder Google OAuth authorization URL."""
+    redirect_uri = str(request.url_for("google_oauth_callback"))
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?redirect_uri={redirect_uri}&client_id=your-google-client-id&response_type=code&scope=openid%20email%20profile"
+    return {"auth_url": auth_url}
+
+
+@router.get("/google/callback", name="google_oauth_callback")
+def google_oauth_callback(code: str = "", state: str = ""):
+    """Stub callback handler for Google OAuth."""
+    # Exchange 'code' for tokens and create/login the user in a real implementation.
+    raise HTTPException(status_code=501, detail="Google OAuth not yet implemented")

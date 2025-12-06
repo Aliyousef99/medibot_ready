@@ -1,4 +1,6 @@
 import axios from 'axios';
+import { useAuthStore } from "../state/authStore";
+import { useToastStore } from "../state/toastStore";
 
 export interface ChatResponseCombined {
   request_id: string;
@@ -63,21 +65,103 @@ export interface RecommendationSet {
   created_at?: string;
 }
 
+const runtimeBase =
+  typeof window !== 'undefined' && (window as any).__CHAT_API_BASE__
+    ? String((window as any).__CHAT_API_BASE__)
+    : '';
+const envBase = (import.meta as any)?.env?.VITE_API_BASE ? String((import.meta as any).env.VITE_API_BASE) : '';
+const resolvedBase = (runtimeBase || envBase || 'http://localhost:8000').replace(/\/+$/, '');
+
 const api = axios.create({
-    baseURL: 'http://localhost:8000', // Adjust if your backend is on a different port
-    withCredentials: true,
+  baseURL: resolvedBase,
+  withCredentials: true,
 });
 
 api.interceptors.request.use(config => {
-    const authData = localStorage.getItem('auth');
-    if (authData) {
-        const { token } = JSON.parse(authData);
-        if (token) {
-            config.headers.Authorization = `Bearer ${token}`;
-        }
+  const authData = localStorage.getItem('auth');
+  if (authData) {
+    const { token } = JSON.parse(authData);
+    if (token) {
+      config.headers = config.headers || {};
+      (config.headers as any).Authorization = `Bearer ${token}`;
+      if (process.env.NODE_ENV !== "production") {
+        // eslint-disable-next-line no-console
+        console.debug("API request with bearer", { url: config.url });
+      }
+    } else if (process.env.NODE_ENV !== "production") {
+      // eslint-disable-next-line no-console
+      console.debug("API request missing token", { url: config.url });
     }
-    return config;
+  } else if (process.env.NODE_ENV !== "production") {
+    // eslint-disable-next-line no-console
+    console.debug("API request without auth data", { url: config.url });
+  }
+  return config;
 });
+
+let isRefreshing = false;
+let refreshQueue: Array<() => void> = [];
+
+const flushQueue = () => {
+  refreshQueue.forEach(fn => fn());
+  refreshQueue = [];
+};
+
+export function handleApiError(error: any) {
+  const status = error?.response?.status;
+  const toast = useToastStore.getState();
+  const msg =
+    status === 400
+      ? "We could not process that request. Please check your input."
+      : status === 401
+      ? "Unauthorized. Please log in again."
+      : status === 403
+      ? "You do not have access to perform this action."
+      : status === 429
+      ? "You have hit the rate limit. Please wait a moment and try again."
+      : status === 500
+      ? "Server error. Please try again shortly."
+      : error?.message || "Network error. Please try again.";
+  toast.add({ type: status === 500 ? "error" : "info", message: msg });
+}
+
+api.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    const status = error?.response?.status;
+    const original = error.config;
+    if (status === 401 && !original?._retry) {
+      original._retry = true;
+      const authStore = useAuthStore.getState();
+      const toast = useToastStore.getState();
+
+      const doRefresh = async () => {
+        try {
+          isRefreshing = true;
+          authStore.startRefresh();
+          // Placeholder refresh: just logout; hook up real refresh token call when available.
+          throw new Error("session expired");
+        } finally {
+          isRefreshing = false;
+          authStore.finishRefresh();
+          flushQueue();
+        }
+      };
+
+      if (!isRefreshing) {
+        await doRefresh().catch(() => {
+          authStore.logout();
+          toast.add({ type: "error", message: "Your session expired. Please log in again." });
+        });
+      } else {
+        await new Promise<void>((resolve) => refreshQueue.push(resolve));
+      }
+      // After refresh/log out, do not retry; surface 401
+    }
+    handleApiError(error);
+    return Promise.reject(error);
+  }
+);
 
 export const register = async (email: string, password: string): Promise<any> => {
     const response = await api.post('/api/auth/register', { email, password });
@@ -104,9 +188,8 @@ export const updateProfile = async (profileData: any): Promise<any> => {
 export const extractText = async (file: File): Promise<{ text: string }> => {
     const formData = new FormData();
     formData.append('file', file);
-    const response = await api.post('/api/extract_text', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-    });
+    // Let the browser set the correct multipart boundary; avoid overriding Content-Type
+    const response = await api.post('/api/extract_text', formData);
     return response.data;
 };
 
