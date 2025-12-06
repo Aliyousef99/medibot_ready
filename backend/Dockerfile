@@ -22,9 +22,12 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
-# Copy application code
-COPY . /app
+# Copy application code into /app/backend so module imports like "backend.*" resolve
+COPY . /app/backend
+
+# Ensure Python can resolve the backend package
+ENV PYTHONPATH="/app"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
