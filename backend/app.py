@@ -97,6 +97,14 @@ logger = configure_logging()
 
 # ---- Rate limiting (slowapi) ----
 app.add_middleware(TracingMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS if "*" not in CORS_ALLOW_ORIGINS else ["*"],
+    allow_origin_regex=CORS_ORIGIN_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 try:
     from slowapi import Limiter
     from slowapi.util import get_remote_address
@@ -267,15 +275,6 @@ def _init_db():
         raise
     _init_redis()
     _maybe_seed_demo_user()
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=CORS_ALLOW_ORIGINS if "*" not in CORS_ALLOW_ORIGINS else ["*"],
-        allow_origin_regex=CORS_ORIGIN_REGEX,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
 # include existing routers
 app.include_router(auth_routes.router)
