@@ -1265,9 +1265,16 @@ def _persist_message(db: Session, conv: Conversation, user: User, role: MessageR
         role=role.value if hasattr(role, "value") else str(role).lower(),
         content=content,
     )
-    db.add(msg)
-    db.commit()
-    db.refresh(msg)
+    try:
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     return msg
 
 
@@ -2110,6 +2117,10 @@ async def chat(
     try:
         _persist_message(db, conv, user, MessageRole.ASSISTANT, ai_explanation or "")
     except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.warning("db_persist_assistant_message_failed", exc_info=True)
 
     # Final integrity log before return: keys present in payload

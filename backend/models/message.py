@@ -24,7 +24,15 @@ class Message(Base):
         String(36), ForeignKey("conversations.id", ondelete="CASCADE"), index=True
     )
     user_id: Mapped[str] = mapped_column(String(36), index=True)
-    role: Mapped[MessageRole] = mapped_column(SAEnum(MessageRole), nullable=False)
+    # Force using enum values (lowercase strings) for compatibility with existing DB enum type
+    role: Mapped[MessageRole] = mapped_column(
+        SAEnum(
+            MessageRole,
+            values_callable=lambda obj: [e.value for e in obj],
+            name="messagerole",
+        ),
+        nullable=False,
+    )
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(

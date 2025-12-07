@@ -98,9 +98,13 @@ function ChatView() {
     else document.documentElement.classList.remove("dark");
   }, [dark]);
 
-  // Load server-side conversations when the user is present
+  // Load server-side conversations when the user is present (once per user)
+  const conversationsLoadedRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!user) return;
+    const userKey = user ? String(user.email || user.id || "anon") : null;
+    if (!userKey) return;
+    if (conversationsLoadedRef.current === userKey) return;
+    conversationsLoadedRef.current = userKey;
     (async () => {
       try {
         const serverConvos: ConversationSummary[] = await listConversations();
@@ -121,7 +125,7 @@ function ChatView() {
         addToast({ type: "error", message: e?.message || "Could not load conversations." });
       }
     })();
-  }, [user, actions, addToast]);
+  }, [user, addToast, actions]);
 
   // auth bootstrap handled by auth store; no local restore
 
