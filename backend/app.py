@@ -34,6 +34,8 @@ from backend.auth.deps import hash_password, get_current_user
 from backend.models.user import User, UserProfile
 from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
+from backend.models.conversation import Conversation
+from backend.models.message import Message, MessageRole
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
@@ -328,8 +330,10 @@ class ParseRequest(BaseModel):
 
 class ChatIn(BaseModel):
     message: str
+    conversation_id: Optional[str] = None
 
 class ChatOut(BaseModel):
+    conversation_id: Optional[str] = None
     request_id: str
     summary: Optional[str] = ""
     symptom_analysis: Dict[str, Any]
@@ -342,6 +346,21 @@ class ChatOut(BaseModel):
     missing_fields: Optional[List[str]] = None
     triage: Optional[Dict[str, Any]] = None
     user_view: Optional[Dict[str, Any]] = None
+
+class ConversationOut(BaseModel):
+    id: str
+    title: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+class MessageOut(BaseModel):
+    id: str
+    role: str
+    content: str
+    created_at: datetime
+
+class ConversationCreate(BaseModel):
+    title: Optional[str] = None
 
 class ExplainIn(BaseModel):
     structured: Dict[str, Any]
@@ -1215,6 +1234,42 @@ def get_chat_history(user_id: str):
         logger.debug("get_chat_history failed", extra={"error": str(exc)})
         return []
 
+# ---- Conversation persistence helpers ----
+def _ensure_conversation(db: Session, user: User, conv_id: Optional[str], first_message: str) -> Conversation:
+    """Fetch or create a conversation for this user."""
+    if conv_id:
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == conv_id, Conversation.user_id == str(user.id))
+            .first()
+        )
+        if conv:
+            return conv
+    title = (first_message or "").strip()
+    if len(title) > 60:
+        title = title[:60] + "..."
+    conv = Conversation(user_id=str(user.id), title=title or "New chat")
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return conv
+
+def _persist_message(db: Session, conv: Conversation, user: User, role: MessageRole, content: str) -> Message:
+    try:
+        conv.updated_at = datetime.utcnow()
+    except Exception:
+        pass
+    msg = Message(
+        conversation_id=conv.id,
+        user_id=str(user.id),
+        role=role,
+        content=content,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
 
 @app.post("/api/chat", response_model=ChatOut)
 # Relax rate limits to support continuous chat sessions
@@ -1247,11 +1302,16 @@ async def chat(
     except Exception:
         pass
 
-    # Append the incoming user message to per-user chat history
+    # Ensure a conversation exists and persist incoming user message
+    conv = _ensure_conversation(db, user, getattr(payload, "conversation_id", None), payload.message or "")
     try:
         append_chat_history(str(user.id), "user", payload.message or "")
     except Exception:
         pass
+    try:
+        _persist_message(db, conv, user, MessageRole.USER, payload.message or "")
+    except Exception:
+        logger.warning("db_persist_user_message_failed", exc_info=True)
 
     # Inline extractor: run early for pasted lab-like messages; do NOT write to DB
     user_view: Optional[Dict[str, Any]] = None
@@ -2047,6 +2107,10 @@ async def chat(
         append_chat_history(str(user.id), "assistant", ai_explanation or "")
     except Exception:
         pass
+    try:
+        _persist_message(db, conv, user, MessageRole.ASSISTANT, ai_explanation or "")
+    except Exception:
+        logger.warning("db_persist_assistant_message_failed", exc_info=True)
 
     # Final integrity log before return: keys present in payload
     try:
@@ -2067,6 +2131,7 @@ async def chat(
         pass
 
     return ChatOut(
+        conversation_id=str(conv.id),
         request_id=request_id,
         summary=summary,
         symptom_analysis=symptom_analysis,
@@ -2206,6 +2271,57 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
     except Exception as e:
         logger.exception("explain failed")
         return ExplainOut(explanation=f"⚠️ Gemini error: {e}")
+
+# --- Conversation list/history endpoints ---
+@router.get("/chat/conversations", response_model=List[ConversationOut])
+def list_conversations(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    items = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == str(user.id))
+        .order_by(Conversation.updated_at.desc())
+        .all()
+    )
+    return items
+
+@router.post("/chat/conversations", response_model=ConversationOut)
+def create_conversation(payload: ConversationCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    title = (payload.title or "").strip() or "New chat"
+    conv = Conversation(user_id=str(user.id), title=title)
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return conv
+
+@router.get("/chat/conversations/{conversation_id}/messages", response_model=List[MessageOut])
+def get_conversation_messages(conversation_id: str, limit: int = 50, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.user_id == str(user.id))
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    msgs = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(msgs))
+
+@router.delete("/chat/conversations/{conversation_id}", status_code=204)
+def delete_conversation(conversation_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.user_id == str(user.id))
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.delete(conv)
+    db.commit()
+    return None
 
 # Register the local /api/explain route after it has been attached to the router
 app.include_router(router)
