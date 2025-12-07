@@ -97,6 +97,7 @@ type ChatActions = {
   setTriageFor: (id: string, triage: { level: string; reasons?: string[] } | null) => void;
   setUrgentAckFor: (id: string, ack: boolean) => void;
   applyToActive: (mutator: (msgs: Message[]) => Message[]) => void;
+  setMessagesFor: (id: string, msgs: Message[]) => void;
   addConversation: (title?: string) => string;
   deleteConversation: (id: string) => void;
   setConversations: (c: Conversation[]) => void;
@@ -238,6 +239,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
         conversations: s.conversations.map((c) => (c.id === activeId ? { ...c, messages: mutator(c.messages) } : c)),
       }));
     },
+    setMessagesFor: (id, msgs) =>
+      set((s) => ({
+        conversations: s.conversations.map((c) => (c.id === id ? { ...c, messages: msgs } : c)),
+      })),
     addConversation: (title = "New chat") => {
       const id = `c_${Date.now()}`;
       const convo: Conversation = { id, title, messages: [] };

@@ -32,13 +32,15 @@ export default function AuthScreen({ onAuth }: AuthScreenProps) {
       const loginData = await apiLogin(email, password);
       const token = loginData.access_token;
 
-      const userScaffold = { id: 0, email, token };
+      // Defer assigning id until we fetch profile (to avoid shared chat scope across users)
+      const userScaffold = { id: undefined as any, email, token };
       // Set auth immediately so subsequent calls carry the bearer token
       setUser(userScaffold);
 
       const profile = await apiGetProfile().catch(() => null);
+      const resolvedId = (profile && (profile as any).user_id) || email;
 
-      const user = { ...userScaffold, profile };
+      const user = { ...userScaffold, id: resolvedId, profile };
 
       setUser(user);
       onAuth(user);

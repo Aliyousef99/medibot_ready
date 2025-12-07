@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import DOMPurify from "dompurify";
 import { Moon, Sun, Menu } from "lucide-react";
 import AuthScreen from "./AuthScreen";
@@ -6,8 +7,8 @@ import ProfileModal from "./ProfileModal";
 import ConversationList from "./ConversationList";
 import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
-import { postChatMessage as apiChat, extractText as apiExtract } from "../services/api";
-import type { ChatResponseCombined } from "../services/api";
+import { postChatMessage as apiChat, extractText as apiExtract, listConversations, createConversation, deleteConversationApi, getConversationMessages } from "../services/api";
+import type { ChatResponseCombined, ConversationSummary, ConversationMessageRow } from "../services/api";
 import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
 import { useToastStore } from "../state/toastStore";
@@ -97,21 +98,86 @@ function ChatView() {
     else document.documentElement.classList.remove("dark");
   }, [dark]);
 
+  // Load server-side conversations when the user is present
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
+      try {
+        const serverConvos: ConversationSummary[] = await listConversations();
+        const mapped = serverConvos.map((c) => ({
+          id: c.id,
+          title: c.title || "Chat",
+          messages: [],
+        }));
+        if (mapped.length === 0) {
+          const created = await createConversation("New chat");
+          actions.setConversations([{ id: created.id, title: created.title || "New chat", messages: [] }]);
+          actions.setActiveId(created.id);
+        } else {
+          actions.setConversations(mapped);
+          actions.setActiveId(mapped[0].id);
+        }
+      } catch (e: any) {
+        addToast({ type: "error", message: e?.message || "Could not load conversations." });
+      }
+    })();
+  }, [user, actions, addToast]);
+
   // auth bootstrap handled by auth store; no local restore
 
-  function newConversation() {
-    const id = actions.addConversation("New chat");
-    actions.setStructuredFor(id, null);
-    actions.setExplanationFor(id, "");
-    actions.setExplanationSourceFor(id, undefined);
-    actions.setSymptomAnalysisResult(null);
+  async function newConversation() {
+    try {
+      const created = await createConversation("New chat");
+      const conv = { id: created.id, title: created.title || "New chat", messages: [] };
+      const next = [conv, ...conversations.filter((c) => c.id !== conv.id)];
+      actions.setConversations(next);
+      actions.setActiveId(conv.id);
+      actions.setStructuredFor(conv.id, null);
+      actions.setExplanationFor(conv.id, "");
+      actions.setExplanationSourceFor(conv.id, undefined);
+      actions.setSymptomAnalysisResult(null);
+    } catch (e: any) {
+      addToast({ type: "error", message: e?.message || "Unable to start a new chat." });
+    }
   }
 
-  function deleteConversation(id: string) {
-    const wasActive = activeId === id;
-    actions.deleteConversation(id);
-    if (wasActive) {
-      actions.setSymptomAnalysisResult(null);
+  async function deleteConversation(id: string) {
+    try {
+      await deleteConversationApi(id);
+      const wasActive = activeId === id;
+      actions.deleteConversation(id);
+      if (wasActive) {
+        actions.setSymptomAnalysisResult(null);
+      }
+    } catch (e: any) {
+      addToast({ type: "error", message: e?.message || "Could not delete conversation." });
+    }
+  }
+
+  async function ensureActiveConversation(): Promise<string> {
+    if (activeId) return activeId;
+    const created = await createConversation("New chat");
+    const conv = { id: created.id, title: created.title || "New chat", messages: [] };
+    actions.setConversations([conv, ...conversations.filter((c) => c.id !== conv.id)]);
+    actions.setActiveId(conv.id);
+    return conv.id;
+  }
+
+  async function selectConversation(id: string) {
+    actions.setActiveId(id);
+    const existing = conversations.find((c) => c.id === id);
+    if (existing && existing.messages && existing.messages.length > 0) return;
+    try {
+      const rows: ConversationMessageRow[] = await getConversationMessages(id, 100);
+      const mapped: Message[] = rows.map((r) => ({
+        id: r.id,
+        role: r.role as any,
+        content: r.content,
+        ts: new Date(r.created_at),
+      }));
+      actions.setMessagesFor(id, mapped);
+    } catch (e: any) {
+      addToast({ type: "error", message: e?.message || "Could not load conversation history." });
     }
   }
 
@@ -119,25 +185,33 @@ function ChatView() {
     const text = input.trim();
     if (!text || !user) return;
 
+    const conversationId = activeId || (await ensureActiveConversation());
     actions.setBusy(true);
     const newUserMessage: Message = { id: `m_${Date.now()}`, role: "user", content: text, ts: new Date() };
     actions.applyToActive((msgs) => [...msgs, newUserMessage]);
     actions.setInput("");
 
     try {
-      const chatResponse: ChatResponseCombined = await apiChat(text);
-      if (activeId) {
-        actions.setStructuredFor(activeId, chatResponse.pipeline || null);
-        actions.setExplanationFor(activeId, chatResponse.ai_explanation || "");
-        actions.setExplanationSourceFor(activeId, chatResponse.ai_explanation_source as any);
+      const chatResponse: ChatResponseCombined = await apiChat(text, conversationId);
+      const targetConversationId = chatResponse.conversation_id || conversationId || activeId || "";
+      if (targetConversationId && targetConversationId !== activeId) {
+        actions.setActiveId(targetConversationId);
+      }
+      if (targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
+        actions.setConversations([{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations]);
+      }
+      if (targetConversationId) {
+        actions.setStructuredFor(targetConversationId, chatResponse.pipeline || null);
+        actions.setExplanationFor(targetConversationId, chatResponse.ai_explanation || "");
+        actions.setExplanationSourceFor(targetConversationId, chatResponse.ai_explanation_source as any);
         if (Array.isArray(chatResponse.missing_fields)) {
-          actions.setMissingFieldsFor(activeId, chatResponse.missing_fields as any);
+          actions.setMissingFieldsFor(targetConversationId, chatResponse.missing_fields as any);
           actions.setHideProfileBanner(
             hideProfileBanner || (chatResponse.missing_fields || []).length === 0
           );
         }
         if (chatResponse.triage) {
-          actions.setTriageFor(activeId, chatResponse.triage as any);
+          actions.setTriageFor(targetConversationId, chatResponse.triage as any);
         }
         try {
           const sa = chatResponse.symptom_analysis as any;
@@ -211,7 +285,7 @@ function ChatView() {
     (async () => {
       try {
         actions.setBusy(true);
-        const resp: ChatResponseCombined = await apiChat(lastUser.content);
+        const resp: ChatResponseCombined = await apiChat(lastUser.content, activeId || undefined);
         if (activeId) {
           actions.setStructuredFor(activeId, resp.pipeline || null);
           actions.setExplanationFor(activeId, resp.ai_explanation || "");
@@ -274,7 +348,7 @@ function ChatView() {
           <ConversationList
             conversations={conversations}
             activeId={activeId}
-            onSelect={(id) => actions.setActiveId(id)}
+            onSelect={(id) => selectConversation(id)}
             onNew={newConversation}
             onDelete={deleteConversation}
             dark={dark}

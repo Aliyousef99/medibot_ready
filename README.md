@@ -123,6 +123,46 @@ If Tesseract or PDF text extraction isn't available, the endpoint will return an
 
 ---
 
+## Zero-Cost Tunneling (Run Backend Locally, Use Vercel Frontend)
+
+If you want the deployed Vercel frontend to talk to your locally running FastAPI backend without paying for hosting, tunnel your localhost to a temporary HTTPS URL:
+
+1) Start the backend locally (keep `.env` with your keys):
+```bash
+cd backend
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+2) Expose it with a free tunnel (pick one):
+- **Cloudflare**: install `cloudflared`, then  
+  ```bash
+  cloudflared tunnel --url http://localhost:8000
+  ```  
+  Copy the `https://<something>.trycloudflare.com` URL it prints.
+- **ngrok**: login once (`ngrok config add-authtoken <token>`), then  
+  ```bash
+  ngrok http 8000
+  ```  
+  Copy the `https://<random>.ngrok.io` URL it prints.
+
+3) Point the Vercel frontend at the tunnel:
+- In Vercel Project Settings → Environment Variables, set `VITE_API_BASE` to the tunnel URL (no trailing slash) and redeploy.  
+- For quick testing without redeploy, open the browser console on the Vercel site and set:  
+  ```js
+  window.__CHAT_API_BASE__ = "https://<your-tunnel>";
+  location.reload();
+  ```
+
+4) Verify:
+- Visit `https://<your-tunnel>/health` in a browser to confirm the backend is reachable.
+- On the Vercel site, send a message/upload a lab; network requests should hit the tunnel host.
+
+Notes:
+- Keep your machine awake and the backend running; the tunnel dies if the process stops.
+- ngrok free URLs change every run; update `VITE_API_BASE` or use the console override when it changes. Cloudflare URLs are often stickier per session; a named tunnel can make it persistent (still free).
+
+---
+
 ## ## Local Database & Demo User
 
 - The backend now targets Postgres by default via `DATABASE_URL`. You can still point to SQLite for quick dev by setting `DATABASE_URL=sqlite:///./medibot.db` (with `check_same_thread=False` automatically set).

@@ -3,6 +3,7 @@ import { useAuthStore } from "../state/authStore";
 import { useToastStore } from "../state/toastStore";
 
 export interface ChatResponseCombined {
+  conversation_id?: string;
   request_id: string;
   summary?: string;
   user_view?: {
@@ -35,6 +36,20 @@ export interface ChatResponseCombined {
     level: 'ok' | 'watch' | 'urgent' | string;
     reasons?: string[];
   };
+}
+
+export interface ConversationSummary {
+  id: string;
+  title?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationMessageRow {
+  id: string;
+  role: string;
+  content: string;
+  created_at: string;
 }
 
 export interface SymptomAnalysisResult {
@@ -199,8 +214,10 @@ export const extractText = async (file: File): Promise<{ text: string }> => {
     return response.data;
 };
 
-export const postChatMessage = async (message: string): Promise<ChatResponseCombined> => {
-  const response = await api.post('/api/chat', { message });
+export const postChatMessage = async (message: string, conversationId?: string): Promise<ChatResponseCombined> => {
+  const payload: any = { message };
+  if (conversationId) payload.conversation_id = conversationId;
+  const response = await api.post('/api/chat', payload);
   if (process.env.NODE_ENV !== 'production') {
     // DEV: Log RAW payload before any transformation and explicitly surface required keys
     // eslint-disable-next-line no-console
@@ -249,4 +266,25 @@ export const deleteHistory = async (labId: string): Promise<void> => {
 export const getRecommendationsForLab = async (labId: string): Promise<RecommendationSet> => {
   const res = await api.post('/api/recommendations/generate', { lab_id: labId });
   return res.data as RecommendationSet;
+};
+
+// ---------- Conversations ----------
+
+export const listConversations = async (): Promise<ConversationSummary[]> => {
+  const res = await api.get('/api/chat/conversations');
+  return res.data as ConversationSummary[];
+};
+
+export const createConversation = async (title?: string): Promise<ConversationSummary> => {
+  const res = await api.post('/api/chat/conversations', { title });
+  return res.data as ConversationSummary;
+};
+
+export const deleteConversationApi = async (conversationId: string): Promise<void> => {
+  await api.delete(`/api/chat/conversations/${conversationId}`);
+};
+
+export const getConversationMessages = async (conversationId: string, limit = 50): Promise<ConversationMessageRow[]> => {
+  const res = await api.get(`/api/chat/conversations/${conversationId}/messages`, { params: { limit } });
+  return res.data as ConversationMessageRow[];
 };
