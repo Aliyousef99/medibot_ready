@@ -1,5 +1,4 @@
-import React, { useEffect, useMemo, useRef } from "react";
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { Moon, Sun, Menu } from "lucide-react";
 import AuthScreen from "./AuthScreen";
@@ -37,6 +36,7 @@ function ChatView() {
   const { user, setUser, logout } = useAuth();
   const { add: addToast } = useToastStore();
   const lastScopeRef = useRef<string | null>(null);
+  const [analysisOpen, setAnalysisOpen] = useState(true);
   const conversations = useChatStore((s) => s.conversations);
   const activeId = useChatStore((s) => s.activeId);
   const structuredById = useChatStore((s) => s.structuredById);
@@ -333,6 +333,10 @@ function ChatView() {
     return <AuthScreen onAuth={(u) => setUser(u)} />;
   }
 
+  const gridCols = analysisOpen
+    ? "lg:grid-cols-[300px_minmax(0,1fr)_360px]"
+    : "lg:grid-cols-[300px_minmax(0,1fr)]";
+
   return (
     <div className="h-screen w-full overflow-hidden bg-zinc-50 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50">
       <div className="lg:hidden flex items-center justify-between p-3 border-b border-zinc-200 dark:border-zinc-800">
@@ -340,12 +344,12 @@ function ChatView() {
           <Menu className="w-5 h-5" />
         </button>
         <div className="font-semibold">Classic Chatbot</div>
-        <button className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800" onClick={() => actions.setDark(!dark)}>
-          {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-        </button>
-      </div>
+          <button className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800" onClick={() => actions.setDark(!dark)}>
+            {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+          </button>
+        </div>
 
-      <div className="h-[calc(100vh-0px)] grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)_360px]">
+      <div className={`h-[calc(100vh-0px)] grid grid-cols-1 ${gridCols}`}>
         <div
           className={`min-h-0 h-full ${sidebarOpen ? "block" : "hidden"} lg:block`}
         >
@@ -355,6 +359,8 @@ function ChatView() {
             onSelect={(id) => selectConversation(id)}
             onNew={newConversation}
             onDelete={deleteConversation}
+            onToggleAnalysis={() => setAnalysisOpen((v) => !v)}
+            analysisOpen={analysisOpen}
             dark={dark}
             onToggleDark={() => actions.setDark(!dark)}
             user={user}
@@ -398,18 +404,20 @@ function ChatView() {
           fileBusy={fileBusy}
         />
 
-        <AnalysisPanel
-          devMode={devMode}
-          onToggleDevMode={(v) => actions.setDevMode(v)}
-          structured={structured}
-          explanation={explanation}
-          explanationSource={explanationSourceById[activeId || ""]}
-          user={user}
-          sanitizedExplanation={sanitizedExplanation}
-          prettyRef={prettyRef}
-          activeId={activeId}
-          symptomAnalysisResult={symptomAnalysisResult}
-        />
+        {analysisOpen && (
+          <AnalysisPanel
+            devMode={devMode}
+            onToggleDevMode={(v) => actions.setDevMode(v)}
+            structured={structured}
+            explanation={explanation}
+            explanationSource={explanationSourceById[activeId || ""]}
+            user={user}
+            sanitizedExplanation={sanitizedExplanation}
+            prettyRef={prettyRef}
+            activeId={activeId}
+            symptomAnalysisResult={symptomAnalysisResult}
+          />
+        )}
       </div>
     </div>
   );

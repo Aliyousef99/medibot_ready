@@ -1,5 +1,5 @@
 import React from "react";
-import { MessageSquare, Trash2, Sun, Moon } from "lucide-react";
+import { MessageSquare, Trash2, Sun, Moon, PanelRightOpen, PanelLeftOpen } from "lucide-react";
 import UserMenu from "./UserMenu";
 import type { Conversation, User } from "../types";
 
@@ -9,6 +9,8 @@ type ConversationListProps = {
   onSelect: (id: string) => void;
   onNew: () => void;
   onDelete: (id: string) => void;
+  onToggleAnalysis?: () => void;
+  analysisOpen?: boolean;
   dark: boolean;
   onToggleDark: () => void;
   user: User | null;
@@ -22,6 +24,8 @@ export default function ConversationList({
   onSelect,
   onNew,
   onDelete,
+  onToggleAnalysis,
+  analysisOpen,
   dark,
   onToggleDark,
   user,
@@ -45,6 +49,16 @@ export default function ConversationList({
               New chat
             </button>
             <div className="ml-auto" />
+            {onToggleAnalysis && (
+              <button
+                onClick={onToggleAnalysis}
+                className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                title={analysisOpen ? "Hide analysis" : "Show analysis"}
+                aria-label={analysisOpen ? "Hide analysis" : "Show analysis"}
+              >
+                {analysisOpen ? <PanelRightOpen className="w-5 h-5" /> : <PanelLeftOpen className="w-5 h-5" />}
+              </button>
+            )}
             <button
               onClick={onToggleDark}
               className="p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800"
