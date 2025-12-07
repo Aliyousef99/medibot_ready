@@ -1262,7 +1262,7 @@ def _persist_message(db: Session, conv: Conversation, user: User, role: MessageR
     msg = Message(
         conversation_id=conv.id,
         user_id=str(user.id),
-        role=role,
+        role=role.value if hasattr(role, "value") else str(role).lower(),
         content=content,
     )
     db.add(msg)
