@@ -1,4 +1,6 @@
 import os
+import sys
+from pathlib import Path
 import types
 import uuid
 import io
@@ -8,8 +10,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Ensure JSON columns use generic JSON (not JSONB) under SQLite
+# Ensure tests use an in-memory SQLite DB and JSON columns stay generic
+os.environ.setdefault("DATABASE_URL", "sqlite://")
 os.environ.setdefault("FORCE_GENERIC_JSON", "1")
+
+# Ensure the project root is on sys.path so `import backend` works when running
+# pytest from the repository root.
+ROOT_DIR = Path(__file__).resolve().parents[2]  # repository root
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from backend.app import app
 from backend.db.session import Base, get_db
@@ -44,6 +53,16 @@ def _override_get_db():
 
 app.dependency_overrides[get_db] = _override_get_db
 app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id="user-1", email="u@example.com")
+
+# Ensure code paths that import SessionLocal directly (legacy chat routes) use the test engine/session
+import backend.db.session as session_mod
+session_mod.engine = engine
+session_mod.SessionLocal = TestingSessionLocal
+import backend.models as models_mod
+models_mod.engine = engine
+# Legacy chat routes import SessionLocal directly; point them to the test session
+import backend.routes.chat_routes as chat_routes_mod
+chat_routes_mod.SessionLocal = TestingSessionLocal
 
 
 @pytest.fixture(autouse=True)
@@ -108,3 +127,18 @@ def mock_ocr(monkeypatch):
             self.pages = [_Pg()]
     import pypdf
     monkeypatch.setattr(pypdf, "PdfReader", _Reader)
+
+
+def pytest_configure(config):
+    """Allow overriding the coverage floor via environment variable for local runs.
+
+    Example (PowerShell):
+      $env:PYTEST_COV_FAIL_UNDER='0'; pytest
+    """
+    env_floor = os.getenv("PYTEST_COV_FAIL_UNDER") or os.getenv("COV_FAIL_UNDER")
+    if env_floor is not None:
+        try:
+            config.option.cov_fail_under = float(env_floor)
+        except Exception:
+            # ignore invalid values; keep existing floor
+            pass

@@ -9,6 +9,7 @@ from sqlalchemy.types import JSON as SA_JSON
 import uuid
 
 from backend.db.session import Base, engine
+from backend.utils.encryption import EncryptedText, EncryptedJSON
 
 # --- Dialect-aware column helpers ---
 try:
@@ -42,6 +43,6 @@ class SymptomEvent(Base):
 
     id = Column(uuid_col_type(), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
-    raw_text = Column(Text, nullable=False)
-    result_json = Column(json_col_type(), nullable=False)
+    raw_text = Column(EncryptedText, nullable=False)
+    result_json = Column(EncryptedJSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

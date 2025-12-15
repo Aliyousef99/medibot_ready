@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, constr
 from backend.db.session import get_db
 from backend.models.user import User
-from backend.auth.jwt import verify_password, create_access_token, hash_password
+from backend.auth.jwt import verify_password, create_access_token, create_refresh_token, verify_refresh_token, hash_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -23,7 +23,8 @@ def login(payload: LoginAny = Body(...), db: Session = Depends(get_db)):
     if not user or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token({"sub": str(user.id), "email": user.email})
-    return {"access_token": token, "token_type": "bearer"}
+    refresh = create_refresh_token({"sub": str(user.id), "email": user.email})
+    return {"access_token": token, "refresh_token": refresh, "token_type": "bearer"}
 
 
 class RegisterIn(BaseModel):
@@ -47,8 +48,9 @@ def register(payload: RegisterIn = Body(...), db: Session = Depends(get_db)):
     )
     db.add(user)
     db.commit()
-    # No token returned here; the UI performs a separate login call.
-    return {"status": "created"}
+    refresh = create_refresh_token({"sub": str(user.id), "email": user.email})
+    access = create_access_token({"sub": str(user.id), "email": user.email})
+    return {"status": "created", "access_token": access, "refresh_token": refresh}
 
 
 # ---- Email verification scaffold (placeholder) ----
@@ -60,7 +62,11 @@ class VerifyRequest(BaseModel):
 def request_verification(payload: VerifyRequest):
     """Stub endpoint for requesting a verification email."""
     # In a production setup, enqueue email with a signed token here.
-    return {"status": "queued", "message": "Verification email flow not yet implemented."}
+    return {
+        "status": "queued",
+        "message": "Verification email flow not yet implemented.",
+        "email": str(payload.email),
+    }
 
 
 @router.get("/verify_email")
@@ -68,6 +74,26 @@ def verify_email(token: str):
     """Stub endpoint for verifying an email token."""
     # In a production setup, decode token and mark user as verified.
     return {"status": "pending", "message": "Email verification is not yet implemented.", "token": token}
+
+
+class RefreshIn(BaseModel):
+    refresh_token: str
+
+
+@router.post("/refresh")
+def refresh(payload: RefreshIn, db: Session = Depends(get_db)):
+    """Exchange a refresh token for a new access token."""
+    data = verify_refresh_token(payload.refresh_token)
+    if not data:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    sub = data.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    user = db.query(User).filter(User.id == str(sub)).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    access = create_access_token({"sub": str(user.id), "email": user.email})
+    return {"access_token": access, "token_type": "bearer"}
 
 
 # ---- Google OAuth stubs ----

@@ -6,7 +6,7 @@ import ProfileModal from "./ProfileModal";
 import ConversationList from "./ConversationList";
 import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
-import { postChatMessage as apiChat, extractText as apiExtract, listConversations, createConversation, deleteConversationApi, getConversationMessages } from "../services/api";
+import { postChatMessage as apiChat, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent } from "../services/api";
 import type { ChatResponseCombined, ConversationSummary, ConversationMessageRow } from "../services/api";
 import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
@@ -37,6 +37,12 @@ function ChatView() {
   const { add: addToast } = useToastStore();
   const lastScopeRef = useRef<string | null>(null);
   const [analysisOpen, setAnalysisOpen] = useState(true);
+  const [uploadStatus, setUploadStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [analysisState, setAnalysisState] = useState<"idle" | "loading" | "error">("idle");
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const consentWarnedRef = useRef(false);
   const conversations = useChatStore((s) => s.conversations);
   const activeId = useChatStore((s) => s.activeId);
   const structuredById = useChatStore((s) => s.structuredById);
@@ -46,6 +52,7 @@ function ChatView() {
   const hideProfileBanner = useChatStore((s) => s.hideProfileBanner);
   const triageById = useChatStore((s) => s.triageById);
   const urgentAckById = useChatStore((s) => s.urgentAckById);
+  const recommendationsById = useChatStore((s) => (s as any).recommendationsById || {});
   const devMode = useChatStore((s) => s.devMode);
   const dark = useChatStore((s) => s.dark);
   const busy = useChatStore((s) => s.busy);
@@ -60,6 +67,9 @@ function ChatView() {
     () => conversations.find((c) => c.id === activeId) ?? null,
     [conversations, activeId]
   );
+
+  const triage = triageById[activeId || ""];
+  const recommendations = recommendationsById[activeId || ""];
 
   const structured = activeId ? structuredById[activeId] ?? null : null;
   const explanation = activeId ? explanationById[activeId] ?? "" : "";
@@ -97,6 +107,35 @@ function ChatView() {
     if (dark) document.documentElement.classList.add("dark");
     else document.documentElement.classList.remove("dark");
   }, [dark]);
+  // Seed theme preference on first load
+  useEffect(() => {
+    const stored = localStorage.getItem("medibot.dark");
+    if (stored === null) {
+      const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      actions.setDark(prefersDark);
+    }
+  }, [actions]);
+
+  // Encourage profile completion on first load based on stored profile data
+  useEffect(() => {
+    if (!user) return;
+    const p: any = user.profile || {};
+    const missing: string[] = [];
+    if (p.age === undefined || p.age === null || p.age === "") missing.push("age");
+    if (!p.sex) missing.push("sex");
+    if (!Array.isArray(p.conditions) || p.conditions.length === 0) missing.push("conditions");
+    if (!Array.isArray(p.medications) || p.medications.length === 0) missing.push("medications");
+    if (!missing.length) return;
+    const targetId = activeId || conversations[0]?.id;
+    if (!targetId) return;
+    if ((missingFieldsById[targetId] || []).length === 0) {
+      actions.setMissingFieldsFor(targetId, missing);
+      actions.setHideProfileBanner(false);
+    }
+  }, [user, activeId, conversations, missingFieldsById, actions]);
+
+  // Guided first-run: if no conversations or no messages, show a nudge in sidebar
+  const firstRun = !active || (active.messages || []).length === 0;
 
   // Load server-side conversations when the user is present (once per user)
   const conversationsLoadedRef = useRef<string | null>(null);
@@ -120,6 +159,18 @@ function ChatView() {
         } else {
           actions.setConversations(mapped);
           actions.setActiveId(mapped[0].id);
+          try {
+            const rows: ConversationMessageRow[] = await getConversationMessages(mapped[0].id, 100);
+            const msgs: Message[] = rows.map((r) => ({
+              id: r.id,
+              role: r.role as any,
+              content: r.content,
+              ts: new Date(r.created_at),
+            }));
+            actions.setMessagesFor(mapped[0].id, msgs);
+          } catch (e: any) {
+            addToast({ type: "error", message: e?.message || "Could not load conversation history." });
+          }
         }
       } catch (e: any) {
         addToast({ type: "error", message: e?.message || "Could not load conversations." });
@@ -188,9 +239,15 @@ function ChatView() {
   async function handleSend() {
     const text = input.trim();
     if (!text || !user) return;
+    if (!user.profile?.consent_given && !consentWarnedRef.current) {
+      addToast({ type: "info", message: "For best results, please consent to data processing (see banner above)." });
+      consentWarnedRef.current = true;
+    }
 
     const conversationId = activeId || (await ensureActiveConversation());
     actions.setBusy(true);
+    setAnalysisState("loading");
+    setAnalysisError(null);
     const newUserMessage: Message = { id: `m_${Date.now()}`, role: "user", content: text, ts: new Date() };
     actions.applyToActive((msgs) => [...msgs, newUserMessage]);
     actions.setInput("");
@@ -204,10 +261,18 @@ function ChatView() {
       if (targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
         actions.setConversations([{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations]);
       }
+      if (chatResponse.timed_out) {
+        addToast({ type: "info", message: "AI timed out; showing local recommendations instead." });
+      } else if (chatResponse.ai_explanation_source === "fallback") {
+        addToast({ type: "info", message: "AI explanation unavailable; showing structured recommendations." });
+      }
       if (targetConversationId) {
         actions.setStructuredFor(targetConversationId, chatResponse.pipeline || null);
         actions.setExplanationFor(targetConversationId, chatResponse.ai_explanation || "");
         actions.setExplanationSourceFor(targetConversationId, chatResponse.ai_explanation_source as any);
+        if ((chatResponse as any).local_recommendations) {
+          actions.setRecommendationsFor(targetConversationId, (chatResponse as any).local_recommendations);
+        }
         if (Array.isArray(chatResponse.missing_fields)) {
           actions.setMissingFieldsFor(targetConversationId, chatResponse.missing_fields as any);
           actions.setHideProfileBanner(
@@ -253,8 +318,11 @@ function ChatView() {
         rawResponse: chatResponse,
       };
       actions.applyToActive((msgs) => [...msgs, botMessage]);
+      setAnalysisState("idle");
     } catch (err: any) {
       addToast({ type: "error", message: err?.message || "Chat request failed. Please try again." });
+      setAnalysisState("error");
+      setAnalysisError(err?.message || "Chat request failed");
     } finally {
       actions.setBusy(false);
     }
@@ -262,12 +330,19 @@ function ChatView() {
 
   async function onFilePicked(file: File) {
     actions.setFileBusy(true);
+    setUploadStatus("loading");
+    setUploadError(null);
     try {
-      const { text } = await apiExtract(file);
-      actions.setInput(text);
+      const lab = await uploadLabAndSave(file);
+      actions.setInput(lab.raw_text || "");
+      addToast({ type: "info", message: "Lab uploaded and saved to history." });
       rerunLastMessage("lab_upload");
+      setUploadStatus("success");
+      setTimeout(() => setUploadStatus("idle"), 1200);
     } catch (e: any) {
-      addToast({ type: "error", message: e?.message || "File extraction failed. Please try again." });
+      addToast({ type: "error", message: e?.message || "File upload or parsing failed. Please try again." });
+      setUploadStatus("error");
+      setUploadError(e?.message || "Upload failed");
     } finally {
       actions.setFileBusy(false);
     }
@@ -289,6 +364,8 @@ function ChatView() {
     (async () => {
       try {
         actions.setBusy(true);
+        setAnalysisState("loading");
+        setAnalysisError(null);
         const resp: ChatResponseCombined = await apiChat(lastUser.content, activeId || undefined);
         if (activeId) {
           actions.setStructuredFor(activeId, resp.pipeline || null);
@@ -299,6 +376,7 @@ function ChatView() {
           }
           if (resp.triage) actions.setTriageFor(activeId, resp.triage as any);
         }
+        setAnalysisState("idle");
         const assistantText = resp.ai_explanation || resp.summary || "";
         const safeText = DOMPurify.sanitize(assistantText, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
         const msg: Message = {
@@ -359,15 +437,16 @@ function ChatView() {
             onSelect={(id) => selectConversation(id)}
             onNew={newConversation}
             onDelete={deleteConversation}
-            onToggleAnalysis={() => setAnalysisOpen((v) => !v)}
-            analysisOpen={analysisOpen}
-            dark={dark}
-            onToggleDark={() => actions.setDark(!dark)}
-            user={user}
-            onProfile={() => actions.setProfileOpen(true)}
-            onLogout={() => logout()}
-          />
-        </div>
+          onToggleAnalysis={() => setAnalysisOpen((v) => !v)}
+          analysisOpen={analysisOpen}
+          dark={dark}
+          onToggleDark={() => actions.setDark(!dark)}
+          user={user}
+          onProfile={() => actions.setProfileOpen(true)}
+          onLogout={() => logout()}
+          firstRun={firstRun}
+        />
+      </div>
         {user && (
           <ProfileModal
             open={profileOpen}
@@ -385,7 +464,7 @@ function ChatView() {
         <ChatWindow
           active={active}
           devMode={devMode}
-          triage={triageById[activeId || ""]}
+          triage={triage}
           urgentAck={urgentAckById[activeId || ""]}
           onAckUrgent={() => actions.setUrgentAckFor(activeId || "", true)}
           missingFields={missingFieldsById[activeId || ""] || []}
@@ -395,29 +474,52 @@ function ChatView() {
           uploadInputRef={uploadInputRef}
           onUploadClick={() => uploadInputRef.current?.click()}
           onFilePicked={onFilePicked}
-          messages={active?.messages || []}
-          onSend={handleSend}
-          onKeyDown={onKeyDown}
-          input={input}
-          setInput={actions.setInput}
-          busy={busy}
-          fileBusy={fileBusy}
-        />
+          uploadStatus={uploadStatus}
+          uploadError={uploadError}
+          onClearUploadError={() => setUploadError(null)}
+          analysisState={analysisState}
+          analysisError={analysisError}
+      messages={active?.messages || []}
+      onSend={handleSend}
+      onKeyDown={onKeyDown}
+      input={input}
+      setInput={actions.setInput}
+      busy={busy}
+      fileBusy={fileBusy}
+      needsConsent={!user.profile?.consent_given}
+      consentBusy={consentBusy}
+      onConsent={async () => {
+        if (consentBusy) return;
+        try {
+          setConsentBusy(true);
+          const res = await setConsent(true);
+          setUser({ ...user, profile: { ...(user.profile || {}), consent_given: res.consent_given, consent_at: res.consent_at } });
+          addToast({ type: "info", message: "Consent recorded. You can withdraw anytime from Profile." });
+        } catch (e: any) {
+          addToast({ type: "error", message: e?.message || "Could not record consent." });
+        } finally {
+          setConsentBusy(false);
+        }
+      }}
+    />
 
         {analysisOpen && (
           <AnalysisPanel
             devMode={devMode}
             onToggleDevMode={(v) => actions.setDevMode(v)}
             structured={structured}
-            explanation={explanation}
-            explanationSource={explanationSourceById[activeId || ""]}
-            user={user}
-            sanitizedExplanation={sanitizedExplanation}
-            prettyRef={prettyRef}
-            activeId={activeId}
-            symptomAnalysisResult={symptomAnalysisResult}
-          />
-        )}
+          explanation={explanation}
+          explanationSource={explanationSourceById[activeId || ""]}
+          user={user}
+          sanitizedExplanation={sanitizedExplanation}
+          prettyRef={prettyRef}
+          activeId={activeId}
+          symptomAnalysisResult={symptomAnalysisResult}
+          recommendations={recommendations as any}
+          analysisState={analysisState}
+          analysisError={analysisError}
+        />
+      )}
       </div>
     </div>
   );

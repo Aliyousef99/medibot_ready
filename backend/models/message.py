@@ -6,6 +6,7 @@ from sqlalchemy import String, DateTime, ForeignKey, text, Enum as SAEnum, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.db.session import Base
+from backend.utils.encryption import EncryptedText
 
 
 class MessageRole(str, Enum):
@@ -33,7 +34,7 @@ class Message(Base):
         ),
         nullable=False,
     )
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(EncryptedText, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

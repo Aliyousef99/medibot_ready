@@ -47,6 +47,13 @@ def upsert_profile(
     prof.conditions = payload.conditions or []
     prof.medications = payload.medications or []
     prof.notes = payload.notes
+    if payload.consent_given is not None:
+        prof.consent_given = bool(payload.consent_given)
+        if prof.consent_given:
+            from datetime import datetime
+            prof.consent_at = datetime.utcnow()
+        else:
+            prof.consent_at = None
 
     db.add(prof)
     db.commit()

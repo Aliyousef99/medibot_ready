@@ -36,14 +36,19 @@ def generate_recommendations(
         lab_report = db.query(LabReport).filter(LabReport.id == request.lab_id, LabReport.user_id == current_user.id).first()
         if not lab_report:
             raise HTTPException(status_code=404, detail="Lab report not found")
-        labs = lab_report.results
+        # Use structured JSON payload from stored lab report; prefer explicit tests array when available
+        structured = lab_report.structured_json or {}
+        if isinstance(structured, dict) and "tests" in structured:
+            labs = structured.get("tests") or []
+        else:
+            labs = structured if structured is not None else []
 
         from datetime import datetime, timedelta
         recent_symptoms = db.query(SymptomEvent).filter(
             SymptomEvent.user_id == current_user.id,
             SymptomEvent.created_at >= datetime.utcnow() - timedelta(days=7)
         ).all()
-        symptoms = [{"description": s.symptom_description} for s in recent_symptoms]
+        symptoms = [{"description": getattr(s, "symptom_description", None) or getattr(s, "raw_text", "")} for s in recent_symptoms]
 
     if not labs and not symptoms:
         raise HTTPException(status_code=400, detail="Either labs or symptoms must be provided.")

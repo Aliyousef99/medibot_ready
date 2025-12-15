@@ -166,12 +166,25 @@ def get_history(
         db.close()
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    q = db.query(Message).filter(Message.conversation_id == conv.id)
+    # Fetch all ordered messages (conversations are small), then slice for simple cursor pagination
+    ordered = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .all()
+    )
+    items: list[Message]
     if before_id:
-        anchor = db.query(Message).filter(Message.id == before_id, Message.conversation_id == conv.id).first()
-        if anchor:
-            q = q.filter(Message.created_at < anchor.created_at)
-    items = q.order_by(Message.created_at.desc()).limit(limit).all()
+        ids = [m.id for m in ordered]
+        try:
+            idx = ids.index(before_id)
+            items = ordered[idx + 1 : idx + 1 + limit]
+        except ValueError:
+            items = ordered[:limit]
+    else:
+        items = ordered[:limit]
+    # Return oldest-first within the page for stable pagination semantics
+    items = list(reversed(items))
 
     def to_dict(m: Message) -> Dict[str, Any]:
         return {

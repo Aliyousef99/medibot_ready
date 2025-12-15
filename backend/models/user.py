@@ -9,10 +9,12 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Integer,
+    Boolean,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON as SA_JSON
+from backend.utils.encryption import EncryptedText, EncryptedJSON
 
 # Import Base/engine from your session module (no circular import)
 from backend.db.session import Base, engine
@@ -93,13 +95,15 @@ class UserProfile(Base):
     )
 
     # Lightweight fields
-    age: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    sex: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # "male"|"female"|"other"|None
+    age: Mapped[Optional[int]] = mapped_column(EncryptedJSON, nullable=True)
+    sex: Mapped[Optional[str]] = mapped_column(EncryptedText, nullable=True)  # "male"|"female"|"other"|None
 
     # Flexible JSON blobs
-    conditions: Mapped[Optional[list]] = mapped_column(json_col_type(), nullable=True, default=None)
-    medications: Mapped[Optional[list]] = mapped_column(json_col_type(), nullable=True, default=None)
-    notes: Mapped[Optional[str]] = mapped_column(String(4000), nullable=True)
+    conditions: Mapped[Optional[list]] = mapped_column(EncryptedJSON, nullable=True, default=None)
+    medications: Mapped[Optional[list]] = mapped_column(EncryptedJSON, nullable=True, default=None)
+    notes: Mapped[Optional[str]] = mapped_column(EncryptedText, nullable=True)
+    consent_given: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("0"))
+    consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

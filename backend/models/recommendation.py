@@ -3,6 +3,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 from ..db.session import Base
 import datetime
+from backend.utils.encryption import EncryptedText, EncryptedJSON
 
 class RecommendationSet(Base):
     __tablename__ = "recommendation_sets"
@@ -11,8 +12,8 @@ class RecommendationSet(Base):
     user_id: Mapped[str] = mapped_column(sa.ForeignKey("users.id"))
     
     risk_tier: Mapped[str] = mapped_column(sa.String, nullable=False)
-    actions: Mapped[list[str]] = mapped_column(sa.JSON, nullable=False)
-    text: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    actions: Mapped[list[str]] = mapped_column(EncryptedJSON, nullable=False)
+    text: Mapped[str] = mapped_column(EncryptedText, nullable=False)
     
     rules_version: Mapped[str] = mapped_column(sa.String, nullable=False, default="1.0")
     llm_used: Mapped[bool] = mapped_column(sa.Boolean, default=False)

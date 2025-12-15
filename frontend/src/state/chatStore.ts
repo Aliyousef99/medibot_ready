@@ -68,6 +68,7 @@ type ChatState = {
   missingFieldsById: Record<string, string[]>;
   hideProfileBanner: boolean;
   triageById: Record<string, { level: string; reasons?: string[] }>;
+  recommendationsById: Record<string, any>;
   urgentAckById: Record<string, boolean>;
   devMode: boolean;
   dark: boolean;
@@ -95,6 +96,7 @@ type ChatActions = {
   setExplanationSourceFor: (id: string, source: "model" | "fallback" | "skipped" | undefined) => void;
   setMissingFieldsFor: (id: string, fields: string[]) => void;
   setTriageFor: (id: string, triage: { level: string; reasons?: string[] } | null) => void;
+    setRecommendationsFor: (id: string, recs: any | null) => void;
   setUrgentAckFor: (id: string, ack: boolean) => void;
   applyToActive: (mutator: (msgs: Message[]) => Message[]) => void;
   setMessagesFor: (id: string, msgs: Message[]) => void;
@@ -138,6 +140,7 @@ function loadInitialState(scope?: string | null): ChatState {
         structuredById: parsed.structuredById || {},
         explanationById: parsed.explanationById || {},
         explanationSourceById: parsed.explanationSourceById || {},
+        recommendationsById: parsed.recommendationsById || {},
         missingFieldsById: parsed.missingFieldsById || {},
         hideProfileBanner,
         triageById: parsed.triageById || {},
@@ -163,6 +166,7 @@ function loadInitialState(scope?: string | null): ChatState {
     structuredById: {},
     explanationById: {},
     explanationSourceById: {},
+    recommendationsById: {},
     missingFieldsById: {},
     hideProfileBanner,
     triageById: {},
@@ -231,6 +235,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
       set((s) => ({
         triageById: triage ? { ...s.triageById, [id]: triage } : s.triageById,
       })),
+    setRecommendationsFor: (id, recs) => set((s) => ({ recommendationsById: { ...s.recommendationsById, [id]: recs } })),
     setUrgentAckFor: (id, ack) => set((s) => ({ urgentAckById: { ...s.urgentAckById, [id]: ack } })),
     applyToActive: (mutator) => {
       const activeId = get().activeId;
@@ -303,6 +308,7 @@ useChatStore.subscribe((state) => {
       structuredById: state.structuredById,
       explanationById: state.explanationById,
       explanationSourceById: state.explanationSourceById,
+      recommendationsById: state.recommendationsById,
       missingFieldsById: state.missingFieldsById,
       triageById: state.triageById,
       urgentAckById: state.urgentAckById,

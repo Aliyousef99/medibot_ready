@@ -26,7 +26,7 @@ async def handle_http_exception(request: Request, exc: HTTPException):
     detail: Any = exc.detail
     message = detail if isinstance(detail, str) else "HTTP error"
     body = {"code": status_to_code(exc.status_code), "message": message, "trace_id": trace_id}
-    if not isinstance(detail, str) and detail is not None:
+    if detail is not None:
         body["details"] = detail
     return JSONResponse(status_code=exc.status_code, content=body)
 

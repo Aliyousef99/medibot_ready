@@ -8,7 +8,6 @@ import {
   LabReport,
 } from '../services/api';
 import { Eye, Trash2, X, Loader2, AlertCircle, CheckCircle2, TriangleAlert, Info, RefreshCw } from 'lucide-react';
-import { useToastStore } from '../state/toastStore';
 import { handleApiError } from '../services/api';
 
 const HistoryPage: React.FC = () => {
@@ -17,9 +16,8 @@ const HistoryPage: React.FC = () => {
   const [labToDelete, setLabToDelete] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailLoadingId, setDetailLoadingId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const toast = useToastStore();
 
   const fetchHistory = async () => {
     setLoading(true);
@@ -40,7 +38,7 @@ const HistoryPage: React.FC = () => {
   }, []);
 
   const handleViewDetails = async (labId: string) => {
-    setDetailLoading(true);
+    setDetailLoadingId(labId);
     setError(null);
     try {
       const data = await getHistoryDetail(labId);
@@ -49,7 +47,7 @@ const HistoryPage: React.FC = () => {
       handleApiError(err);
       setError(`Failed to fetch lab details: ${err.message || "Network error"}`);
     } finally {
-      setDetailLoading(false);
+      setDetailLoadingId(null);
     }
   };
 
@@ -69,18 +67,20 @@ const HistoryPage: React.FC = () => {
     }
   };
 
-  if (loading) {
-    return (
-      <div className="p-6 flex items-center justify-center">
-        <Loader2 className="w-8 h-8 animate-spin mr-2" />
-        <span>Loading history...</span>
-      </div>
-    );
-  }
-
   return (
-    <div className="p-4 md:p-6">
-      <h1 className="text-2xl font-bold mb-4">Lab Report History</h1>
+    <div className="p-4 md:p-6 bg-gradient-to-br from-zinc-900 via-zinc-950 to-emerald-950 min-h-screen text-zinc-100">
+      <h1 className="text-2xl font-bold mb-4 text-white">Lab Report History</h1>
+      {loading && (
+        <div className="space-y-3 mb-4" role="status" aria-label="Loading lab history">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="p-4 border border-zinc-800 rounded-lg animate-pulse bg-zinc-900/80">
+              <div className="h-4 w-40 bg-zinc-800 rounded mb-2" />
+              <div className="h-3 w-full bg-zinc-800 rounded mb-1" />
+              <div className="h-3 w-3/4 bg-zinc-800 rounded" />
+            </div>
+          ))}
+        </div>
+      )}
       
       {error && (
         <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
@@ -102,27 +102,49 @@ const HistoryPage: React.FC = () => {
 
       {labs.length === 0 && !loading ? (
         <div className="text-center py-12">
-          <p className="text-gray-500">You have no saved lab reports yet.</p>
+          <p className="text-zinc-400">You have no saved lab reports yet.</p>
           <button
             onClick={fetchHistory}
-            className="mt-3 inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-300 hover:bg-zinc-100"
+            className="mt-3 inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-700 hover:bg-zinc-800 text-zinc-100"
           >
             <RefreshCw className="w-4 h-4" /> Refresh
           </button>
+          <div className="mt-4 text-xs text-zinc-500 space-y-1">
+            <div>Steps to start:</div>
+            <div>1) Complete your profile (age/sex/conditions/meds).</div>
+            <div>2) Upload a lab report from the chat composer.</div>
+            <div>3) Ask a question to save the structured lab + summary here.</div>
+          </div>
         </div>
       ) : (
         <div className="space-y-4">
           {labs.map((lab) => (
-            <div key={lab.id} className="p-4 border rounded-lg flex justify-between items-center">
-              <div>
-                <p className="font-semibold">Report from {new Date(lab.created_at).toLocaleDateString()}</p>
-                <p className="text-sm text-gray-600 truncate max-w-md">{lab.summary}</p>
+            <div key={lab.id} className="p-4 border border-zinc-800 rounded-xl bg-zinc-900/70 shadow-sm flex justify-between items-center hover:border-emerald-400 hover:bg-zinc-900 transition">
+              <div className="text-left">
+                <p className="font-semibold text-zinc-50">Report from {new Date(lab.created_at).toLocaleDateString()}</p>
+                <p className="text-sm text-zinc-300 truncate max-w-md">{lab.summary}</p>
+                {detailLoadingId === lab.id && (
+                  <div className="flex items-center gap-2 text-xs text-emerald-300 mt-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Loading details...
+                  </div>
+                )}
               </div>
               <div className="flex items-center space-x-2">
-                <button onClick={() => handleViewDetails(lab.id)} className="p-2 hover:bg-gray-100 rounded disabled:opacity-50" disabled={detailLoading}>
-                  {detailLoading && selectedLab?.id !== lab.id ? <Loader2 className="w-5 h-5 animate-spin"/> : <Eye size={20} />}
+                <button
+                  onClick={() => handleViewDetails(lab.id)}
+                  className="p-2 hover:bg-emerald-900/40 rounded-xl disabled:opacity-50"
+                  disabled={detailLoadingId !== null}
+                  aria-label="View details"
+                >
+                  {detailLoadingId === lab.id ? <Loader2 className="w-5 h-5 animate-spin" /> : <Eye size={20} />}
                 </button>
-                <button onClick={() => setLabToDelete(lab.id)} className="p-2 hover:bg-red-100 rounded disabled:opacity-50" disabled={deleting}>
+                <button
+                  onClick={() => setLabToDelete(lab.id)}
+                  className="p-2 hover:bg-red-900/40 rounded-xl disabled:opacity-50"
+                  disabled={deleting}
+                  aria-label="Delete lab"
+                >
                   <Trash2 size={20} className="text-red-500" />
                 </button>
               </div>
@@ -177,11 +199,22 @@ const LabDetailModal: React.FC<{ lab: LabReport; onClose: () => void }> = ({ lab
   }
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
-      <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-2xl max-h-full overflow-y-auto">
+    <div
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm flex justify-center items-center p-4 z-50"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div className="bg-zinc-950 text-zinc-100 rounded-2xl shadow-2xl p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto border border-emerald-500/40">
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-xl font-bold">Lab Report Details</h2>
-          <button onClick={onClose} className="p-2 hover:bg-gray-100 rounded-full">
+          <h2 className="text-xl font-bold text-white">Lab Report Details</h2>
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-zinc-900 rounded-full text-zinc-300"
+            aria-label="Close"
+          >
             <X size={24} />
           </button>
         </div>
@@ -192,11 +225,11 @@ const LabDetailModal: React.FC<{ lab: LabReport; onClose: () => void }> = ({ lab
           </div>
           <div>
             <h3 className="font-semibold">AI Summary</h3>
-            <p className="text-gray-700 whitespace-pre-wrap">{lab.summary}</p>
+            <p className="text-zinc-200 whitespace-pre-wrap">{lab.summary}</p>
           </div>
           <div>
             <h3 className="font-semibold">Structured Data</h3>
-            <pre className="bg-gray-100 p-4 rounded-lg text-sm overflow-x-auto">
+            <pre className="bg-zinc-900 text-zinc-100 p-4 rounded-lg text-sm overflow-x-auto border border-zinc-800">
               {JSON.stringify(lab.structured_json, null, 2)}
             </pre>
           </div>
@@ -204,13 +237,17 @@ const LabDetailModal: React.FC<{ lab: LabReport; onClose: () => void }> = ({ lab
             <button
               onClick={handleGetRecs}
               disabled={recLoading}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-60"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-500 text-white hover:bg-emerald-400 disabled:opacity-60 shadow-sm"
             >
               {recLoading && <Loader2 className="w-4 h-4 animate-spin"/>}
               Get Recommendations
             </button>
+            {recLoading && <div className="mt-2 text-xs text-emerald-300">Generating rule-based recommendations...</div>}
             {recError && (
-              <div className="mt-3 text-sm text-red-600">{recError}</div>
+              <div className="mt-3 text-sm text-red-300 flex items-center gap-2 bg-red-900/40 border border-red-800 rounded-lg px-3 py-2">
+                <AlertCircle className="w-4 h-4" />
+                <span>{recError}</span>
+              </div>
             )}
             {recs && (
               <div className={`mt-4 rounded-xl border p-4 ${tierClass(recs.risk_tier)}`}>
@@ -218,7 +255,7 @@ const LabDetailModal: React.FC<{ lab: LabReport; onClose: () => void }> = ({ lab
                   {tierIcon(recs.risk_tier)}
                   <span>Risk tier: {recs.risk_tier}</span>
                   {!recs.llm_used && (
-                    <span className="ml-auto text-[10px] px-2 py-0.5 rounded bg-white/60 text-zinc-600 flex items-center gap-1">
+                    <span className="ml-auto text-[10px] px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-200 flex items-center gap-1">
                       <Info className="w-3 h-3"/> Generated by rules engine
                     </span>
                   )}
@@ -242,15 +279,15 @@ const LabDetailModal: React.FC<{ lab: LabReport; onClose: () => void }> = ({ lab
 
 const ConfirmationDialog: React.FC<{ onConfirm: () => void; onCancel: () => void; loading: boolean }> = ({ onConfirm, onCancel, loading }) => {
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center p-4 z-50">
-      <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-sm">
-        <h2 className="text-lg font-semibold mb-4">Are you sure?</h2>
-        <p className="mb-6">Do you want to permanently delete this lab report?</p>
+    <div className="fixed inset-0 bg-black/70 flex justify-center items-center p-4 z-50">
+      <div className="bg-zinc-950 text-zinc-100 rounded-lg shadow-xl p-6 w-full max-w-sm border border-zinc-800">
+        <h2 className="text-lg font-semibold mb-4 text-white">Are you sure?</h2>
+        <p className="mb-6 text-zinc-300">Do you want to permanently delete this lab report?</p>
         <div className="flex justify-end space-x-4">
-          <button onClick={onCancel} className="px-4 py-2 rounded-lg border hover:bg-gray-100" disabled={loading}>
+          <button onClick={onCancel} className="px-4 py-2 rounded-lg border border-zinc-700 hover:bg-zinc-900" disabled={loading}>
             Cancel
           </button>
-          <button onClick={onConfirm} className="px-4 py-2 rounded-lg bg-red-500 text-white hover:bg-red-600 flex items-center gap-2 disabled:opacity-50" disabled={loading}>
+          <button onClick={onConfirm} className="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-500 flex items-center gap-2 disabled:opacity-50" disabled={loading}>
             {loading && <Loader2 className="w-4 h-4 animate-spin"/>}
             {loading ? 'Deleting...' : 'Delete'}
           </button>

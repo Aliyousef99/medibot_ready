@@ -1,6 +1,7 @@
 import React from "react";
-import { ShieldAlert, Copy } from "lucide-react";
+import { ShieldAlert, Copy, AlertTriangle, CheckCircle2, Loader2 } from "lucide-react";
 import type { SymptomAnalysisResult, User } from "../types";
+import type { RecommendationSet } from "../services/api";
 
 type AnalysisPanelProps = {
   devMode: boolean;
@@ -13,6 +14,9 @@ type AnalysisPanelProps = {
   prettyRef: (ref?: any) => string;
   activeId: string | null;
   symptomAnalysisResult: SymptomAnalysisResult | null;
+  recommendations?: RecommendationSet | null;
+  analysisState?: "idle" | "loading" | "error";
+  analysisError?: string | null;
 };
 
 export default function AnalysisPanel({
@@ -26,6 +30,9 @@ export default function AnalysisPanel({
   prettyRef,
   activeId,
   symptomAnalysisResult,
+  recommendations,
+  analysisState = "idle",
+  analysisError,
 }: AnalysisPanelProps) {
   return (
     <section
@@ -39,6 +46,38 @@ export default function AnalysisPanel({
           Dev Mode (Ctrl+D)
         </label>
       </div>
+      {!devMode && analysisState === "loading" && (
+        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 text-xs flex items-center gap-2 text-emerald-700 dark:text-emerald-200">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Generating recommendations...
+        </div>
+      )}
+      {!devMode && analysisState === "error" && (
+        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 text-xs flex items-center gap-2 text-amber-700 dark:text-amber-200">
+          <AlertTriangle className="w-4 h-4" />
+          {analysisError || "Unable to generate recommendations."}
+        </div>
+      )}
+      {!devMode && recommendations && (
+        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 text-xs flex items-center gap-2">
+          {recommendations.risk_tier === "high" ? (
+            <ShieldAlert className="w-4 h-4 text-red-500" title="High risk" />
+          ) : recommendations.risk_tier === "moderate" ? (
+            <AlertTriangle className="w-4 h-4 text-amber-500" title="Moderate risk" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-500" title="Low risk" />
+          )}
+          <span className="font-semibold capitalize">{recommendations.risk_tier} risk</span>
+          <span className="ml-auto text-[11px] text-zinc-400">
+            AI source: {explanationSource === "fallback" ? "fallback" : explanationSource || "model"}
+          </span>
+        </div>
+      )}
+      {!devMode && !recommendations && analysisState === "idle" && (
+        <div className="px-4 py-3 text-xs text-zinc-500 dark:text-zinc-400 border-b border-zinc-200 dark:border-zinc-800">
+          Send a message or upload labs to see recommendations here.
+        </div>
+      )}
       {devMode && (
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
           <div className="text-xs uppercase tracking-wide text-zinc-400">Structured (BioBERT-style)</div>
@@ -170,6 +209,31 @@ export default function AnalysisPanel({
               )}
             </ul>
           </div>
+          {recommendations && (
+            <div className="space-y-2 text-sm rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900">
+              <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-zinc-400">
+                <span>Recommendations</span>
+                <span className="ml-auto inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-[11px]">
+                  {recommendations.risk_tier === "high" ? (
+                    <ShieldAlert className="w-3.5 h-3.5 text-red-500" />
+                  ) : recommendations.risk_tier === "moderate" ? (
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+                  ) : (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                  )}
+                  Tier: {recommendations.risk_tier}
+                </span>
+              </div>
+              <ul className="space-y-1">
+                {(recommendations.actions || []).map((a, i) => (
+                  <li key={i} className="flex items-start gap-2">
+                    <Copy className="w-3 h-3 mt-1 text-emerald-500" />
+                    <span>{a}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
     </section>

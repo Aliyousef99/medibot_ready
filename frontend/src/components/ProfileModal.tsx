@@ -1,8 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { updateProfile as apiUpdateProfile } from "../services/api";
+import { updateProfile as apiUpdateProfile, deleteUserData, setConsent } from "../services/api";
 import { useToastStore } from "../state/toastStore";
 import type { User } from "../types";
+import { useAuth } from "../hooks/useAuth";
+import { chatScopeForUser, useChatStore } from "../state/chatStore";
 
 type ProfileModalProps = {
   open: boolean;
@@ -16,10 +18,13 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
   const [sex, setSex] = useState("");
   const [conditions, setConditions] = useState("");
   const [medications, setMedications] = useState("");
+  const [consent, setConsentState] = useState<boolean>(false);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const { add: addToast } = useToastStore();
+  const { logout, setUser } = useAuth();
 
   useEffect(() => {
     if (!open) return;
@@ -28,6 +33,7 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
     setSex(p.sex ?? "");
     setConditions(Array.isArray(p.conditions) ? p.conditions.join(", ") : "");
     setMedications(Array.isArray(p.medications) ? p.medications.join(", ") : "");
+    setConsentState(!!p.consent_given);
     setMsg(null);
 
     // focus first input when opening
@@ -88,7 +94,9 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
         sex: sex || null,
         conditions: normConditions,
         medications: normMedications,
+        consent_given: consent,
       });
+      await setConsent(consent);
       onUpdate(updated);
       setMsg("Profile saved successfully!");
       setTimeout(() => onClose(), 1000);
@@ -184,13 +192,58 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
             <span className="text-[12px] text-zinc-400">Comma-separated list.</span>
           </label>
 
+          <label className="flex items-start gap-3 rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-900">
+            <input
+              type="checkbox"
+              checked={consent}
+              onChange={(e) => setConsentState(e.target.checked)}
+              className="mt-1"
+            />
+            <div className="text-sm text-zinc-700 dark:text-zinc-200">
+              <div className="font-medium">Consent to data processing</div>
+              <div className="text-[12px] text-zinc-500 dark:text-zinc-400">
+                I agree to store and process my health data to provide recommendations. You can withdraw consent anytime and delete your data.
+              </div>
+            </div>
+          </label>
+
           {msg && (
             <div className={`text-sm ${msg.startsWith("Save failed") ? "text-red-500" : "text-green-500"}`}>
               {msg}
             </div>
           )}
 
-          <div className="pt-2 flex justify-end gap-2">
+          <div className="pt-2 flex justify-between gap-2 items-center">
+            <button
+              type="button"
+              onClick={async () => {
+                if (deleting) return;
+                const confirmed = window.confirm("Delete all of your stored data (labs, chats, recommendations, profile)? This cannot be undone.");
+                if (!confirmed) return;
+                try {
+                  setDeleting(true);
+                  await deleteUserData();
+                  addToast({ type: "info", message: "Your data was deleted." });
+                  // Keep user logged in but clear local profile/chat state
+                  try {
+                    const scope = chatScopeForUser(user);
+                    useChatStore.getState().resetChat(scope);
+                  } catch {
+                    // best-effort reset
+                  }
+                  setUser({ ...user, profile: {} });
+                  onClose();
+                } catch (e: any) {
+                  addToast({ type: "error", message: e?.message || "Failed to delete data." });
+                } finally {
+                  setDeleting(false);
+                }
+              }}
+              className="text-xs px-3 py-2 rounded-xl border border-red-200 text-red-600 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/30 disabled:opacity-60"
+              disabled={deleting}
+            >
+              {deleting ? "Deleting..." : "Delete all my data"}
+            </button>
             <button
               type="button"
               onClick={onClose}

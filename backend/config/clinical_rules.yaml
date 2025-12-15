@@ -11,6 +11,14 @@ triage:
     high: "Likely needs same-day clinician attention."
     emergent: "Red-flag finding; advise immediate evaluation."
 
+profile_modifiers:
+  age_high_risk: 75
+  age_moderate_risk: 65
+  cardiac_history:
+    keywords: ["cad", "coronary", "heart failure", "cardiomyopathy", "stent", "mi", "heart attack"]
+  renal_history:
+    keywords: ["ckd", "kidney", "renal"]
+
 glucose:
   # Legacy key retained for compatibility with existing code paths
   very_high_mg_dl: 200
@@ -87,6 +95,24 @@ cardiac:
   troponin_ng_ml:
     elevated: 0.04
     critical: 0.1
+
+inflammatory:
+  crp_mg_L:
+    mild: 10
+    high: 30
+  esr_mm_hr:
+    elevated: 30
+
+blood_pressure_rules:
+  systolic_mm_hg:
+    elevated: 120
+    stage1: 130
+    stage2: 140
+    crisis: 180
+  diastolic_mm_hg:
+    stage1: 80
+    stage2: 90
+    crisis: 120
 
 symptoms:
   red_flags:

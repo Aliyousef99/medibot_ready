@@ -28,10 +28,10 @@ const App: React.FC = () => {
 // Wrapper for HistoryPage to include a header with a link back to the chat
 const HistoryPageWithHeader: React.FC = () => {
   return (
-    <div>
-      <header className="p-4 bg-gray-100 border-b">
-        <Link to="/" className="text-blue-500 hover:underline">
-          &larr; Back to Chat
+    <div className="min-h-screen bg-gradient-to-br from-zinc-900 via-zinc-950 to-emerald-950 text-zinc-100">
+      <header className="p-4 border-b border-zinc-800 bg-zinc-900/80 backdrop-blur">
+        <Link to="/" className="inline-flex items-center gap-2 text-emerald-300 hover:text-emerald-200 hover:underline">
+          <span aria-hidden="true">&larr;</span> Back to Chat
         </Link>
       </header>
       <HistoryPage />

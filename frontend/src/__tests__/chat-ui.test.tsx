@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { vi, beforeEach, test, expect } from "vitest";
 import { useAuthStore } from "../state/authStore";
 import ClassicChatbotUI from "../components/ClassicChatbotUI";
+import * as Api from "../services/api";
 
 vi.mock("../services/api", () => {
   return {
@@ -19,6 +20,14 @@ vi.mock("../services/api", () => {
       disclaimer: "",
     }),
     extractText: vi.fn().mockResolvedValue({ text: "mock extracted text" }),
+    uploadLabAndSave: vi.fn().mockResolvedValue({
+      id: "lab1",
+      raw_text: "lab text",
+      summary: "summary",
+      structured_json: {},
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
   };
 });
 
@@ -53,7 +62,7 @@ test("file upload extracts text into composer", async () => {
   fireEvent.change(uploadInput, { target: { files: [file] } });
   await waitFor(async () => {
     const textarea = await screen.findByPlaceholderText(/Paste lab text or type your question/i);
-    expect((textarea as HTMLTextAreaElement).value).toBe("mock extracted text");
+    expect((textarea as HTMLTextAreaElement).value).toBe("lab text");
   });
 });
 
@@ -63,4 +72,37 @@ test("can create a new conversation from the sidebar", async () => {
   fireEvent.click(newChatBtn);
   const listButtons = screen.getAllByRole("button", { name: /New chat|Welcome/i });
   expect(listButtons.length).toBeGreaterThanOrEqual(2);
+});
+
+test("maps local recommendations and fallback into analysis panel", async () => {
+  const mockPost = Api as any;
+  mockPost.postChatMessage.mockResolvedValueOnce({
+    ai_explanation: "",
+    ai_explanation_source: "fallback",
+    summary: "",
+    pipeline: null,
+    request_id: "req-2",
+    symptom_analysis: null,
+    local_recommendations: { risk_tier: "high", actions: ["Do something urgent"], priority: "high", follow_up: "", rationale: "" },
+    disclaimer: "",
+    triage: { level: "urgent", reasons: ["red flag"] },
+  });
+  render(<ClassicChatbotUI />);
+  const textarea = await screen.findByPlaceholderText(/Paste lab text or type your question/i);
+  fireEvent.change(textarea, { target: { value: "Help" } });
+  fireEvent.click(screen.getByRole("button", { name: /Send/i }));
+  expect(await screen.findByText(/Urgent/)).toBeInTheDocument();
+  expect(await screen.findByText(/High risk/i)).toBeInTheDocument();
+});
+
+test("shows upload success banner and prefills composer", async () => {
+  const uploadLabel = render(<ClassicChatbotUI />).getByLabelText("Upload file");
+  const input = uploadLabel.querySelector("input") as HTMLInputElement;
+  const file = new File(["foo"], "lab.txt", { type: "text/plain" });
+  fireEvent.change(input, { target: { files: [file] } });
+  await waitFor(async () => {
+    expect(await screen.findByText(/Lab uploaded/i)).toBeInTheDocument();
+  });
+  const textarea = await screen.findByPlaceholderText(/Paste lab text or type your question/i);
+  expect((textarea as HTMLTextAreaElement).value).toBe("lab text");
 });

@@ -7,8 +7,9 @@ from backend.db.session import get_db
 from backend.models.user import User
 from backend.models.lab_report import LabReport
 from backend.schemas.profile import LabReportCreate, LabReportOut
-from backend.services.report_pipeline import process_text
+from backend.services.report_pipeline import process_text, process_upload
 from backend.auth.deps import get_current_user
+from fastapi import File, UploadFile
 
 router = APIRouter(prefix="/api/history", tags=["history"])
 
@@ -89,3 +90,45 @@ def delete_lab_report(
     db.delete(item)
     db.commit()
     return None
+
+@router.post("/labs/upload", response_model=LabReportOut, status_code=status.HTTP_201_CREATED)
+async def upload_lab_report(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    meta = {
+        "filename": file.filename or "upload",
+        "content_type": (file.content_type or "").lower(),
+        "size_bytes": len(data),
+    }
+    try:
+        result = process_upload(data, file.filename or "upload", file.content_type or "")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Upload failed: {exc}")
+
+    structured = result.get("structured") or {}
+    structured["file_meta"] = {
+        **meta,
+        "stored_path": result.get("stored_path"),
+        "stored_name": result.get("stored_name"),
+        "source": result.get("source"),
+    }
+    summary = result.get("explanation") or "Lab summary unavailable."
+    raw_text = result.get("raw_text") or result.get("text") or ""
+
+    item = LabReport(
+        user_id=str(current_user.id),
+        title=file.filename or "Lab Report",
+        raw_text=raw_text,
+        structured_json=structured,
+        summary=summary,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item

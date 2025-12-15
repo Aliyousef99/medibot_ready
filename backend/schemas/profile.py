@@ -32,9 +32,11 @@ class UserProfileIn(BaseModel):
     conditions: Optional[list[str]] = None
     medications: Optional[list[str]] = None
     notes: Optional[str] = None
+    consent_given: Optional[bool] = Field(default=None, description="Explicit consent to process/store data")
 
 class UserProfileOut(UserProfileIn):
     user_id: str
+    consent_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

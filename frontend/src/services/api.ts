@@ -98,6 +98,8 @@ const api = axios.create({
   withCredentials: true,
 });
 
+// Expose the underlying client for tests
+export const apiClient = api;
 api.interceptors.request.use(config => {
   const authData = localStorage.getItem('auth');
   if (authData) {
@@ -127,6 +129,24 @@ const flushQueue = () => {
   refreshQueue.forEach(fn => fn());
   refreshQueue = [];
 };
+
+const refreshAccessToken = async (): Promise<string> => {
+  const stored = localStorage.getItem("auth");
+  if (!stored) throw new Error("session expired");
+  const parsed = JSON.parse(stored);
+  const refresh = parsed.refresh_token;
+  if (!refresh) throw new Error("session expired");
+  const res = await api.post("/api/auth/refresh", { refresh_token: refresh });
+  const newAccess = res.data?.access_token;
+  if (!newAccess) throw new Error("invalid refresh");
+  const authStore = useAuthStore.getState();
+  const nextUser = { ...(authStore.user || {}), token: newAccess, refresh_token: refresh };
+  authStore.setUser(nextUser);
+  return newAccess;
+};
+
+// Test-only hook to exercise refresh logic without firing interceptors
+export const __testRefreshAccessToken = refreshAccessToken;
 
 export function handleApiError(error: any) {
   const status = error?.response?.status;
@@ -160,8 +180,8 @@ api.interceptors.response.use(
         try {
           isRefreshing = true;
           authStore.startRefresh();
-          // Placeholder refresh: just logout; hook up real refresh token call when available.
-          throw new Error("session expired");
+          await refreshAccessToken();
+          return true;
         } finally {
           isRefreshing = false;
           authStore.finishRefresh();
@@ -204,6 +224,20 @@ export const updateProfile = async (profileData: any): Promise<any> => {
     return response.data;
 };
 
+export const getConsent = async (): Promise<{ consent_given: boolean; consent_at?: string | null }> => {
+  const res = await api.get("/api/privacy/consent");
+  return res.data;
+};
+
+export const setConsent = async (consent_given: boolean): Promise<{ consent_given: boolean; consent_at?: string | null }> => {
+  const res = await api.post("/api/privacy/consent", { consent_given });
+  return res.data;
+};
+
+export const deleteUserData = async (): Promise<void> => {
+  await api.delete("/api/privacy/delete_data");
+};
+
 // Note: Symptom analysis is now fused into /api/chat results; no separate call needed.
 
 export const extractText = async (file: File): Promise<{ text: string }> => {
@@ -212,6 +246,13 @@ export const extractText = async (file: File): Promise<{ text: string }> => {
     // Let the browser set the correct multipart boundary; avoid overriding Content-Type
     const response = await api.post('/api/extract_text', formData);
     return response.data;
+};
+
+export const uploadLabAndSave = async (file: File): Promise<LabReport> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await api.post('/api/history/labs/upload', formData);
+  return res.data as LabReport;
 };
 
 export const postChatMessage = async (message: string, conversationId?: string): Promise<ChatResponseCombined> => {

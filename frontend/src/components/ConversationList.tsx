@@ -16,6 +16,7 @@ type ConversationListProps = {
   user: User | null;
   onProfile: () => void;
   onLogout: () => void;
+  firstRun?: boolean;
 };
 
 export default function ConversationList({
@@ -31,6 +32,7 @@ export default function ConversationList({
   user,
   onProfile,
   onLogout,
+  firstRun = false,
 }: ConversationListProps) {
   return (
     <aside className="min-h-0 h-full border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950">
@@ -103,6 +105,13 @@ export default function ConversationList({
               >
                 Start a chat
               </button>
+              {firstRun && (
+                <div className="mt-3 space-y-1 text-xs text-emerald-700 dark:text-emerald-300">
+                  <div>1) Complete your profile (age/sex/conditions/meds) for personalization.</div>
+                  <div>2) Upload a lab report (PDF/Image/Text) to structure your labs.</div>
+                  <div>3) Ask your question to get recommendations.</div>
+                </div>
+              )}
             </div>
           )}
         </div>

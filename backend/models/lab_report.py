@@ -6,6 +6,7 @@ from sqlalchemy import String, DateTime, ForeignKey, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON as SA_JSON
 from backend.db.session import Base, engine
+from backend.utils.encryption import EncryptedText, EncryptedJSON
 
 # ---- Dialect-aware column types ----
 
@@ -49,9 +50,9 @@ class LabReport(Base):
     )
 
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    raw_text: Mapped[str] = mapped_column(String(20000), nullable=False)
-    structured_json: Mapped[Optional[dict]] = mapped_column(json_col_type(), nullable=True)
-    summary: Mapped[Optional[str]] = mapped_column(String(20000), nullable=True)
+    raw_text: Mapped[str] = mapped_column(EncryptedText, nullable=False)
+    structured_json: Mapped[Optional[dict]] = mapped_column(EncryptedJSON, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(EncryptedText, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

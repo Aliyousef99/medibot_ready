@@ -36,7 +36,7 @@ from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
 from backend.models.conversation import Conversation
 from backend.models.message import Message, MessageRole
-from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes
+from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes, chat_routes, privacy_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
 from backend.services.recommendations import recommend, red_flag_triage, lab_triage
@@ -73,6 +73,7 @@ import logging
 from datetime import datetime
 
 from backend.middleware.tracing import TracingMiddleware
+from backend.utils.exceptions import handle_http_exception, handle_unhandled_exception
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):  # type: ignore[override]
@@ -146,6 +147,11 @@ except Exception:
             return getattr(c, 'host', 'unknown') or 'unknown'
         except Exception:
             return 'unknown'
+
+# Standardized error envelopes with trace_id
+from fastapi import Request as _Request, HTTPException as _HTTPException
+app.add_exception_handler(_HTTPException, handle_http_exception)
+app.add_exception_handler(Exception, handle_unhandled_exception)
 
 # ---- Rate limit helpers & handler ----
 import time
@@ -284,6 +290,9 @@ app.include_router(history_routes.router)
 app.include_router(profile_router)   # profile PUT/GET live here
 app.include_router(symptoms_routes.router)
 app.include_router(recs_routes.router, prefix="/api/recommendations")
+# Legacy chat routes (start/send/history) for compatibility with existing tests/clients
+app.include_router(chat_routes.router)
+app.include_router(privacy_routes.router)
 
 # --- health check ---
 @app.get("/health")
@@ -1123,17 +1132,8 @@ def parse_lab(req: ParseRequest, request: Request, db: Session = Depends(get_db)
         return data
 
     except Exception as e:
-        # Never crash the server; return a helpful message
-        # and include a short error string so we know what happened.
         logger.exception("parse_lab failed")
-        return {
-            "tests": [],
-            "conditions": [],
-            "meta": {
-                "engine": "heuristic-ner-placeholder",
-                "error": f"parse_lab failed: {e.__class__.__name__}: {e}",
-            },
-        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/analyze_symptoms")
@@ -1265,6 +1265,10 @@ def _persist_message(db: Session, conv: Conversation, user: User, role: MessageR
         role=role.value if hasattr(role, "value") else str(role).lower(),
         content=content,
     )
+    try:
+        msg.created_at = datetime.utcnow()
+    except Exception:
+        pass
     try:
         db.add(msg)
         db.commit()
@@ -1895,7 +1899,7 @@ async def chat(
         if latest_lab_struct is None:
             lt = {"level": "low", "reasons": [], "suggested_window": "routine follow-up"}
         else:
-            lt = lab_triage(latest_lab_struct)
+            lt = lab_triage(latest_lab_struct, profile_dict)
         # Normalize red-flag triage to low/moderate/high
         level_map = {"ok": "low", "watch": "moderate", "urgent": "high"}
         rf_level = level_map.get((rf or {}).get("level"), "low")
@@ -1917,6 +1921,44 @@ async def chat(
             if r not in seen_r:
                 seen_r.add(r)
                 triage_reasons.append(r)
+        # Profile-aware escalations
+        profile_risk_reasons: list = []
+        try:
+            if profile_dict:
+                age_val = profile_dict.get("age")
+                if isinstance(age_val, (int, float)):
+                    if age_val >= 75 and triage_level != "high":
+                        triage_level = "high"
+                        profile_risk_reasons.append("age >=75")
+                    elif age_val >= 65 and triage_level == "low":
+                        triage_level = "moderate"
+                        profile_risk_reasons.append("age >=65")
+                conds = [str(c).lower() for c in (profile_dict.get("conditions") or []) if str(c).strip()]
+                meds = [str(m).lower() for m in (profile_dict.get("medications") or []) if str(m).strip()]
+                high_risk_conditions = {
+                    "heart failure", "coronary", "cad", "cardiomyopathy", "cancer", "immunosuppression",
+                    "transplant", "pregnancy", "pregnant", "ckd", "kidney", "pulmonary hypertension"
+                }
+                hits: list[str] = []
+                for c in conds:
+                    for label in high_risk_conditions:
+                        if label in c:
+                            hits.append(label)
+                            break
+                if hits:
+                    if triage_level == "low":
+                        triage_level = "moderate"
+                    elif triage_level == "moderate" and any(h in ("heart failure", "coronary", "cad", "cardiomyopathy") for h in hits):
+                        triage_level = "high"
+                    profile_risk_reasons.append(f"condition: {', '.join(sorted(set(hits)))}")
+                if meds and any(tag in m for m in meds for tag in ("prednisone", "steroid", "immunosuppress", "chemo")):
+                    if triage_level == "low":
+                        triage_level = "moderate"
+                    profile_risk_reasons.append("immunosuppressive medication")
+        except Exception:
+            pass
+        if profile_risk_reasons:
+            triage_reasons.extend(f"profile: {r}" for r in profile_risk_reasons)
         # Suggested window by final level (moderate: routine follow-up; high: as soon as practical)
         triage_window = "as soon as practical" if triage_level == "high" else "routine follow-up"
         triage = {"level": triage_level, "reasons": triage_reasons, "suggested_window": triage_window}
@@ -2007,6 +2049,8 @@ async def chat(
     context, notice = build_chat_context(db, user, payload.message, structured_override=latest_lab_struct_early)
     prompt = (
         "You are a helpful medical assistant. Use the provided context to answer the user's question. "
+        "Personalize guidance using the patient's age, sex, pre-existing conditions, and medications from the profile. "
+        "If a profile field is marked N/A, briefly ask for it in one concise sentence. "
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "Provide general, educational information and you may answer follow-up questions about likely causes of abnormal tests (e.g., high ferritin) and typical next steps. "
         "Avoid diagnosis or prescriptions; include caveats and when to seek care. "
@@ -2079,6 +2123,10 @@ async def chat(
                 })
             except Exception:
                 pass
+    # Ensure a safe fallback if the model returned nothing or failed silently
+    if not ai_explanation:
+        ai_explanation = "AI explanation unavailable; showing structured recommendations."
+        ai_explanation_source = "fallback"
 
     # Compute missing context fields for guided completion banner
     missing_fields: List[str] = []
