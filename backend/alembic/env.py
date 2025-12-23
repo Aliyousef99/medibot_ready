@@ -3,6 +3,7 @@ import sys
 from logging.config import fileConfig
 from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
@@ -12,6 +13,9 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 for path in (ROOT_DIR, BACKEND_DIR):
     if str(path) not in sys.path:
         sys.path.append(str(path))
+
+ENV_PATH = BACKEND_DIR / ".env"
+load_dotenv(ENV_PATH, override=True)
 
 config = context.config
 fileConfig(config.config_file_name)
