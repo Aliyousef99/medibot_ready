@@ -32,6 +32,11 @@ function prettyRef(ref?: any) {
   }
 }
 
+function isServerConversationId(id?: string | null): boolean {
+  if (!id) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
 function ChatView() {
   const { user, setUser, logout } = useAuth();
   const { add: addToast } = useToastStore();
@@ -198,7 +203,9 @@ function ChatView() {
 
   async function deleteConversation(id: string) {
     try {
-      await deleteConversationApi(id);
+      if (isServerConversationId(id)) {
+        await deleteConversationApi(id);
+      }
       const wasActive = activeId === id;
       actions.deleteConversation(id);
       if (wasActive) {
@@ -210,16 +217,21 @@ function ChatView() {
   }
 
   async function ensureActiveConversation(): Promise<string> {
-    if (activeId) return activeId;
+    if (activeId && isServerConversationId(activeId)) return activeId;
     const created = await createConversation("New chat");
     const conv = { id: created.id, title: created.title || "New chat", messages: [] };
-    actions.setConversations([conv, ...conversations.filter((c) => c.id !== conv.id)]);
-    actions.setActiveId(conv.id);
+    if (activeId && !isServerConversationId(activeId)) {
+      actions.replaceConversationId(activeId, conv.id);
+    } else {
+      actions.setConversations([conv, ...conversations.filter((c) => c.id !== conv.id)]);
+      actions.setActiveId(conv.id);
+    }
     return conv.id;
   }
 
   async function selectConversation(id: string) {
     actions.setActiveId(id);
+    if (!isServerConversationId(id)) return;
     const existing = conversations.find((c) => c.id === id);
     if (existing && existing.messages && existing.messages.length > 0) return;
     try {
@@ -255,10 +267,16 @@ function ChatView() {
     try {
       const chatResponse: ChatResponseCombined = await apiChat(text, conversationId);
       const targetConversationId = chatResponse.conversation_id || conversationId || activeId || "";
+      const replaced =
+        Boolean(targetConversationId) && Boolean(activeId) && targetConversationId !== activeId;
       if (targetConversationId && targetConversationId !== activeId) {
-        actions.setActiveId(targetConversationId);
+        if (activeId) {
+          actions.replaceConversationId(activeId, targetConversationId);
+        } else {
+          actions.setActiveId(targetConversationId);
+        }
       }
-      if (targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
+      if (!replaced && targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
         actions.setConversations([{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations]);
       }
       if (chatResponse.timed_out) {

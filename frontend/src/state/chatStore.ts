@@ -103,6 +103,7 @@ type ChatActions = {
   addConversation: (title?: string) => string;
   deleteConversation: (id: string) => void;
   setConversations: (c: Conversation[]) => void;
+  replaceConversationId: (oldId: string, newId: string) => void;
   resetChat: (scope?: string | null) => void;
 };
 
@@ -289,6 +290,29 @@ export const useChatStore = create<ChatStore>((set, get) => {
         conversations: convos,
         activeId: safeActiveId(convos, s.activeId),
       })),
+    replaceConversationId: (oldId, newId) =>
+      set((s) => {
+        if (!oldId || !newId || oldId === newId) return s;
+        const conversations = s.conversations.map((c) =>
+          c.id === oldId ? { ...c, id: newId } : c
+        );
+        const moveKey = <T,>(src: Record<string, T>) => {
+          if (!(oldId in src)) return src;
+          const { [oldId]: val, ...rest } = src;
+          return { ...rest, [newId]: val };
+        };
+        return {
+          conversations,
+          activeId: s.activeId === oldId ? newId : s.activeId,
+          structuredById: moveKey(s.structuredById),
+          explanationById: moveKey(s.explanationById),
+          explanationSourceById: moveKey(s.explanationSourceById),
+          missingFieldsById: moveKey(s.missingFieldsById),
+          triageById: moveKey(s.triageById),
+          recommendationsById: moveKey(s.recommendationsById),
+          urgentAckById: moveKey(s.urgentAckById),
+        };
+      }),
     resetChat: (scope) => set(() => loadInitialState(scope)),
   };
 });
