@@ -37,55 +37,57 @@ function requestJson(url, payload) {
 }
 
 module.exports = async (req, res) => {
-  const host = req.headers["x-forwarded-host"] || req.headers.host || "";
-  const origin = host ? `https://${host}` : "https://medibot-ready.vercel.app";
-  const backend = process.env.BACKEND_TUNNEL_URL || "";
-
-  const getParam = (value) => (Array.isArray(value) ? value[0] : value);
-  const code = getParam(req.query.code);
-  const state = getParam(req.query.state);
-  const error = getParam(req.query.error);
-
-  if (error) {
-    res.status(400).send(`OAuth error: ${error}`);
-    return;
-  }
-  if (!backend) {
-    res.status(500).send("Backend tunnel URL is not configured.");
-    return;
-  }
-  if (!code || !state) {
-    res.status(400).send("Missing OAuth parameters.");
-    return;
-  }
-
-  let result;
   try {
-    const url = `${backend.replace(/\\/+$/, "")}/api/auth/google/complete`;
-    result = await requestJson(url, { code, state });
-  } catch (err) {
-    res.status(502).send("Failed to reach backend for OAuth completion.");
-    return;
-  }
+    const host = req.headers["x-forwarded-host"] || req.headers.host || "";
+    const origin = host ? `https://${host}` : "https://medibot-ready.vercel.app";
+    const backend = process.env.BACKEND_TUNNEL_URL || "";
 
-  if (!result || result.status >= 400) {
-    res.status(result?.status || 500).send(result?.data?.detail || "OAuth completion failed.");
-    return;
-  }
+    const query = req.query || {};
+    const getParam = (value) => (Array.isArray(value) ? value[0] : value);
+    const code = getParam(query.code);
+    const state = getParam(query.state);
+    const error = getParam(query.error);
 
-  const data = result.data || {};
-  const redirect = typeof data.redirect === "string" && data.redirect.startsWith(origin)
-    ? data.redirect
-    : `${origin}/#/`;
+    if (error) {
+      res.status(400).send(`OAuth error: ${error}`);
+      return;
+    }
+    if (!backend) {
+      res.status(500).send("Backend tunnel URL is not configured.");
+      return;
+    }
+    if (!code || !state) {
+      res.status(400).send("Missing OAuth parameters.");
+      return;
+    }
 
-  const payload = {
-    email: data.email || "",
-    token: data.access_token || "",
-    refresh_token: data.refresh_token || "",
-  };
+    let result;
+    try {
+      const url = `${backend.replace(/\\/+$/, "")}/api/auth/google/complete`;
+      result = await requestJson(url, { code, state });
+    } catch (err) {
+      res.status(502).send("Failed to reach backend for OAuth completion.");
+      return;
+    }
 
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.status(200).send(`<!doctype html>
+    if (!result || result.status >= 400) {
+      res.status(result?.status || 500).send(result?.data?.detail || "OAuth completion failed.");
+      return;
+    }
+
+    const data = result.data || {};
+    const redirect = typeof data.redirect === "string" && data.redirect.startsWith(origin)
+      ? data.redirect
+      : `${origin}/#/`;
+
+    const payload = {
+      email: data.email || "",
+      token: data.access_token || "",
+      refresh_token: data.refresh_token || "",
+    };
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.status(200).send(`<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -101,4 +103,7 @@ module.exports = async (req, res) => {
     </script>
   </body>
 </html>`);
+  } catch (err) {
+    res.status(500).send("OAuth callback failed.");
+  }
 };
