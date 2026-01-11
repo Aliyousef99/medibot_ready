@@ -1,3 +1,41 @@
+const http = require("node:http");
+const https = require("node:https");
+const { URL } = require("node:url");
+
+function requestJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const body = JSON.stringify(payload);
+    const options = {
+      method: "POST",
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+    const client = parsed.protocol === "https:" ? https : http;
+    const req = client.request(options, (resp) => {
+      let data = "";
+      resp.on("data", (chunk) => (data += chunk));
+      resp.on("end", () => {
+        let parsedBody = null;
+        try {
+          parsedBody = data ? JSON.parse(data) : null;
+        } catch {
+          parsedBody = null;
+        }
+        resolve({ status: resp.statusCode || 500, data: parsedBody });
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 module.exports = async (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host || "";
   const origin = host ? `https://${host}` : "https://medibot-ready.vercel.app";
@@ -21,23 +59,21 @@ module.exports = async (req, res) => {
     return;
   }
 
-  let data;
+  let result;
   try {
-    const response = await fetch(`${backend.replace(/\\/+$/, "")}/api/auth/google/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, state }),
-    });
-    data = await response.json();
-    if (!response.ok) {
-      res.status(response.status).send(data?.detail || "OAuth completion failed.");
-      return;
-    }
+    const url = `${backend.replace(/\\/+$/, "")}/api/auth/google/complete`;
+    result = await requestJson(url, { code, state });
   } catch (err) {
     res.status(502).send("Failed to reach backend for OAuth completion.");
     return;
   }
 
+  if (!result || result.status >= 400) {
+    res.status(result?.status || 500).send(result?.data?.detail || "OAuth completion failed.");
+    return;
+  }
+
+  const data = result.data || {};
   const redirect = typeof data.redirect === "string" && data.redirect.startsWith(origin)
     ? data.redirect
     : `${origin}/#/`;

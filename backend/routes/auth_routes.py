@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, status, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, constr
 from jose import jwt, JWTError
@@ -240,7 +240,11 @@ def google_oauth_start(request: Request, redirect: str | None = None):
         "prompt": "consent",
     }
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
-    return {"auth_url": auth_url}
+    format_hint = (request.query_params.get("format") or "").lower()
+    accept = (request.headers.get("accept") or "").lower()
+    if format_hint == "json" or "application/json" in accept:
+        return {"auth_url": auth_url}
+    return RedirectResponse(url=auth_url, status_code=302)
 
 
 @router.get("/google/callback", name="google_oauth_callback")

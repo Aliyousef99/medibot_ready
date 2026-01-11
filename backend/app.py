@@ -20,10 +20,13 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 ENV_PATH = BASE_DIR / ".env"
+ROOT_ENV_PATH = ROOT_DIR / ".env"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+if ROOT_ENV_PATH.exists():
+    load_dotenv(ROOT_ENV_PATH, override=True)
 load_dotenv(ENV_PATH, override=True)
 
 from pypdf import PdfReader
