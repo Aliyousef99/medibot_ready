@@ -63,7 +63,8 @@ module.exports = async (req, res) => {
 
     let result;
     try {
-      const url = `${backend.replace(/\\/+$/, "")}/api/auth/google/complete`;
+      const base = backend.endsWith("/") ? backend.slice(0, -1) : backend;
+      const url = `${base}/api/auth/google/complete`;
       result = await requestJson(url, { code, state });
     } catch (err) {
       res.status(502).send("Failed to reach backend for OAuth completion.");
@@ -71,7 +72,9 @@ module.exports = async (req, res) => {
     }
 
     if (!result || result.status >= 400) {
-      res.status(result?.status || 500).send(result?.data?.detail || "OAuth completion failed.");
+      const status = (result && result.status) ? result.status : 500;
+      const detail = result && result.data && result.data.detail ? result.data.detail : "OAuth completion failed.";
+      res.status(status).send(detail);
       return;
     }
 
