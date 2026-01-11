@@ -1,13 +1,127 @@
 # backend/routes/auth_routes.py
+import base64
+import hashlib
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, status, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr, constr
+from jose import jwt, JWTError
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 from backend.db.session import get_db
 from backend.models.user import User
 from backend.auth.jwt import verify_password, create_access_token, create_refresh_token, verify_refresh_token, hash_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
+GOOGLE_OAUTH_STATE_TTL_SECONDS = int(os.getenv("GOOGLE_OAUTH_STATE_TTL_SECONDS", "600"))
+GOOGLE_OAUTH_ALG = "HS256"
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+def _make_google_state(payload: dict) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(seconds=GOOGLE_OAUTH_STATE_TTL_SECONDS)
+    body = payload.copy()
+    body.update({"exp": exp, "typ": "google_oauth_state"})
+    return jwt.encode(body, GOOGLE_OAUTH_STATE_SECRET, algorithm=GOOGLE_OAUTH_ALG)
+
+def _decode_google_state(state: str) -> dict | None:
+    try:
+        data = jwt.decode(state, GOOGLE_OAUTH_STATE_SECRET, algorithms=[GOOGLE_OAUTH_ALG])
+    except JWTError:
+        return None
+    if data.get("typ") != "google_oauth_state":
+        return None
+    return data
+
+def _require_google_env() -> tuple[str, str]:
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured")
+    return client_id, client_secret
+
+def _finish_google_oauth(code: str, state: str, request: Request, db: Session) -> dict:
+    client_id, client_secret = _require_google_env()
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing OAuth parameters")
+
+    state_data = _decode_google_state(state)
+    if not state_data:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    redirect_uri = state_data.get("redirect_uri") or os.getenv("GOOGLE_REDIRECT_URI") or str(request.url_for("google_oauth_callback"))
+    token_payload = {
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+        "code_verifier": state_data.get("code_verifier"),
+    }
+    try:
+        token_resp = httpx.post("https://oauth2.googleapis.com/token", data=token_payload, timeout=15)
+        token_data = token_resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Google token exchange failed")
+
+    if token_resp.status_code != 200 or "id_token" not in token_data:
+        raise HTTPException(status_code=401, detail="Google token exchange failed")
+
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token_data["id_token"],
+            google_requests.Request(),
+            client_id,
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    if idinfo.get("nonce") != state_data.get("nonce"):
+        raise HTTPException(status_code=401, detail="Invalid OAuth nonce")
+
+    if idinfo.get("email_verified") is False:
+        raise HTTPException(status_code=401, detail="Google account email is not verified")
+
+    email = idinfo.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account has no email")
+
+    user = db.query(User).filter(User.email == str(email)).first()
+    if not user:
+        user = User(
+            email=str(email),
+            name=idinfo.get("name"),
+            hashed_password=hash_password(secrets.token_urlsafe(32)),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    elif not user.name and idinfo.get("name"):
+        user.name = idinfo.get("name")
+        db.commit()
+
+    access = create_access_token({"sub": str(user.id), "email": user.email})
+    refresh = create_refresh_token({"sub": str(user.id), "email": user.email})
+    response = {
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+        "email": user.email,
+    }
+    redirect = state_data.get("redirect")
+    if redirect:
+        response["redirect"] = redirect
+    return response
 
 class LoginAny(BaseModel):
     email: EmailStr | None = None
@@ -98,15 +212,49 @@ def refresh(payload: RefreshIn, db: Session = Depends(get_db)):
 
 # ---- Google OAuth stubs ----
 @router.get("/google/start")
-def google_oauth_start(request: Request):
-    """Return a placeholder Google OAuth authorization URL."""
-    redirect_uri = str(request.url_for("google_oauth_callback"))
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?redirect_uri={redirect_uri}&client_id=your-google-client-id&response_type=code&scope=openid%20email%20profile"
+def google_oauth_start(request: Request, redirect: str | None = None):
+    """Return a Google OAuth authorization URL."""
+    client_id, _client_secret = _require_google_env()
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI") or str(request.url_for("google_oauth_callback"))
+    nonce = secrets.token_urlsafe(24)
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
+
+    state = _make_google_state({
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+        "redirect": redirect or "",
+    })
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
     return {"auth_url": auth_url}
 
 
 @router.get("/google/callback", name="google_oauth_callback")
-def google_oauth_callback(code: str = "", state: str = ""):
-    """Stub callback handler for Google OAuth."""
-    # Exchange 'code' for tokens and create/login the user in a real implementation.
-    raise HTTPException(status_code=501, detail="Google OAuth not yet implemented")
+def google_oauth_callback(request: Request, code: str = "", state: str = "", db: Session = Depends(get_db)):
+    """Callback handler for Google OAuth."""
+    return _finish_google_oauth(code=code, state=state, request=request, db=db)
+
+
+class GoogleCompleteIn(BaseModel):
+    code: str
+    state: str
+
+
+@router.post("/google/complete")
+def google_oauth_complete(payload: GoogleCompleteIn, request: Request, db: Session = Depends(get_db)):
+    """Complete Google OAuth from a server-side callback proxy."""
+    return _finish_google_oauth(code=payload.code, state=payload.state, request=request, db=db)
