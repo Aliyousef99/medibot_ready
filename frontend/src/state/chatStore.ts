@@ -159,11 +159,11 @@ function loadInitialState(scope?: string | null): ChatState {
   } catch {
     // ignore
   }
-  const initialConversations: Conversation[] = [{ id: "c1", title: "Welcome", messages: seedMessages() }];
+  const initialConversations: Conversation[] = [];
   return {
     storageScope,
     conversations: initialConversations,
-    activeId: initialConversations[0]?.id ?? null,
+    activeId: null,
     structuredById: {},
     explanationById: {},
     explanationSourceById: {},
