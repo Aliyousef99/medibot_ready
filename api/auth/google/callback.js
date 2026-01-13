@@ -36,6 +36,31 @@ function requestJson(url, payload) {
   });
 }
 
+function isAllowedRedirect(candidate, origin) {
+  if (!candidate || typeof candidate !== "string") return false;
+  try {
+    if (candidate.startsWith(origin)) return true;
+    const url = new URL(candidate);
+    const envList = process.env.ALLOWED_REDIRECT_ORIGINS || "";
+    const extraOrigins = envList
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const localOrigins = [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:3000",
+      "http://[::1]:5173",
+      "http://[::1]:3000",
+    ];
+    const allowedOrigins = new Set([...extraOrigins, ...localOrigins]);
+    return allowedOrigins.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
 module.exports = async (req, res) => {
   try {
     const host = req.headers["x-forwarded-host"] || req.headers.host || "";
@@ -79,7 +104,7 @@ module.exports = async (req, res) => {
     }
 
     const data = result.data || {};
-    const redirect = typeof data.redirect === "string" && data.redirect.startsWith(origin)
+    const redirect = isAllowedRedirect(data.redirect, origin)
       ? data.redirect
       : `${origin}/#/`;
 

@@ -13,8 +13,23 @@ export default function AuthScreen({ onAuth }: AuthScreenProps) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(false);
+
+  const allowedDomains = [
+    "gmail.com",
+    "yahoo.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "icloud.com",
+    "aol.com",
+    "protonmail.com",
+  ];
 
   const apiBase =
     (typeof window !== "undefined" && (window as any).__CHAT_API_BASE__) ||
@@ -25,12 +40,29 @@ export default function AuthScreen({ onAuth }: AuthScreenProps) {
   async function submit() {
     setLoading(true);
     setError("");
+    setInfo("");
     try {
       if (mode === "register") {
+        const domain = (email.split("@")[1] || "").toLowerCase();
+        if (!allowedDomains.includes(domain)) {
+          setError("Please use a supported email domain (gmail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, aol.com, protonmail.com).");
+          return;
+        }
+        if (password.length < 6 || password.length > 24) {
+          setError("Password must be between 6 and 24 characters.");
+          return;
+        }
+        if (password !== confirmPassword) {
+          setError("Passwords do not match.");
+          return;
+        }
         const reg = await apiRegister(email, password);
-        // store refresh token if returned
-        if (reg?.refresh_token) {
-          localStorage.setItem("auth", JSON.stringify({ email, refresh_token: reg.refresh_token }));
+        if (reg?.status === "created") {
+          setInfo("Account created. You can log in now.");
+          setMode("login");
+          setPassword("");
+          setConfirmPassword("");
+          return;
         }
       }
       const loginData = await apiLogin(email, password);
@@ -55,7 +87,7 @@ export default function AuthScreen({ onAuth }: AuthScreenProps) {
       if (status === 409 || detail === "User with this email already exists") {
         setError("An account with this email already exists. Try logging in instead.");
       } else if (status === 422 || status === 400) {
-        setError("Please enter a valid email and a password of at least 6 characters.");
+        setError("Please enter a valid email and a password between 6 and 24 characters.");
       } else {
         setError(detail || e?.message || "Unable to sign in right now. Please try again.");
       }
@@ -75,17 +107,54 @@ export default function AuthScreen({ onAuth }: AuthScreenProps) {
           className="mb-2 w-full rounded-md border px-3 py-2"
           disabled={loading}
         />
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Password"
-          className="mb-4 w-full rounded-md border px-3 py-2"
-          disabled={loading}
-        />
+        <div className="relative mb-2">
+          <input
+            type={showPassword ? "text" : "password"}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Password"
+            className="w-full rounded-md border px-3 py-2 pr-16"
+            maxLength={24}
+            disabled={loading}
+          />
+          <button
+            type="button"
+            onClick={() => setShowPassword((v) => !v)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-zinc-500"
+            aria-label={showPassword ? "Hide password" : "Show password"}
+          >
+            {showPassword ? "Hide" : "Show"}
+          </button>
+        </div>
+        {mode === "register" && (
+          <div className="relative mb-2">
+            <input
+              type={showConfirmPassword ? "text" : "password"}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              placeholder="Confirm password"
+              className="w-full rounded-md border px-3 py-2 pr-16"
+              maxLength={24}
+              disabled={loading}
+            />
+            <button
+              type="button"
+              onClick={() => setShowConfirmPassword((v) => !v)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-zinc-500"
+              aria-label={showConfirmPassword ? "Hide password" : "Show password"}
+            >
+              {showConfirmPassword ? "Hide" : "Show"}
+            </button>
+          </div>
+        )}
         {error && (
           <div className="text-red-500 text-sm mb-2 bg-red-100 dark:bg-red-900/20 p-2 rounded-md">
             {error}
+          </div>
+        )}
+        {info && (
+          <div className="text-emerald-600 text-sm mb-2 bg-emerald-100 dark:bg-emerald-900/20 p-2 rounded-md">
+            {info}
           </div>
         )}
         <button

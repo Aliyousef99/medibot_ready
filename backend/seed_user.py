@@ -37,6 +37,7 @@ def main():
             hashed_password=hash_password(password),
             name=name,
         )
+        user.email_verified = True
         db.add(user)
         db.commit()
         db.refresh(user)

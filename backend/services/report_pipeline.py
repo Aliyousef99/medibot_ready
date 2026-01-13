@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from backend.services.glossary import enrich_entities
-from backend.services.lab_parser import parse_lab_text
+from backend.services.lab_parser import parse_lab_report
 from backend.services.ner import detect_medical_entities
 from backend.services.ocr import extract_text_from_bytes
 from backend.services.storage import store_local_upload
@@ -40,7 +40,7 @@ def _generate_explanation(structured: Dict[str, Any], enriched_entities: list[di
 
 
 def process_text(text: str) -> Dict[str, Any]:
-    structured = parse_lab_text(text)
+    structured = parse_lab_report(text)
     ner_out = detect_medical_entities(text)
     enriched_entities = enrich_entities(ner_out.get("entities", []))
     structured["entities"] = enriched_entities

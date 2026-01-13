@@ -27,6 +27,7 @@ class Token(BaseModel):
 
 # ---------- User Profile ----------
 class UserProfileIn(BaseModel):
+    name: Optional[str] = None
     age: Optional[int] = None
     sex: Optional[str] = Field(default=None, description='male|female|other')
     conditions: Optional[list[str]] = None

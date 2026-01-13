@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from backend.services.ner import detect_medical_entities
+
 # Patterns for common lab tests when table parsing misses them.
 TEST_PATTERNS = [
     (
@@ -119,6 +121,7 @@ ROW_PATTERN = re.compile(
 
 def clean_value_token(token: str) -> str:
     text = token.strip()
+    text = text.replace("*", "")
     text = re.sub(r"(?i)\b(" + NUM + r")[HhLl](?:\.)?", r"\1", text)
     text = re.sub(r"[.,]+$", "", text)
     match = re.match(r"^\s*(" + NUM + ")", text)
@@ -127,11 +130,31 @@ def clean_value_token(token: str) -> str:
 
 def detect_flag(token_or_line: str) -> Optional[str]:
     lowered = token_or_line.lower()
-    if re.search(r"\bhigh\b|\(high\)|\bH\b", lowered):
+    if re.search(r"\bhigh\b|\(high\)|(^|\s|\*)h(\b|\s|\*|$)", lowered):
         return "high"
-    if re.search(r"\blow\b|\(low\)|\bL\b", lowered):
+    if re.search(r"\blow\b|\(low\)|(^|\s|\*)l(\b|\s|\*|$)", lowered):
         return "low"
     return None
+
+
+def _looks_like_flag_token(token: str) -> bool:
+    t = token.strip().lower().replace(".", "")
+    return t in {"*", "h", "l", "*h", "*l", "h*", "l*"}
+
+
+def _extract_unit_from_rest(rest: str) -> str:
+    if not rest:
+        return ""
+    cleaned = rest.replace("(", " ").replace(")", " ")
+    for raw in cleaned.split():
+        tok = raw.strip()
+        if not tok:
+            continue
+        if _looks_like_flag_token(tok):
+            continue
+        if re.search(r"[A-Za-z/]", tok):
+            return normalize_unit_text(tok)
+    return ""
 
 
 def parse_bracket_range(line: str) -> Optional[Dict[str, Any]]:
@@ -150,6 +173,30 @@ def parse_bracket_range(line: str) -> Optional[Dict[str, Any]]:
     if between_match:
         lo, hi, unit_tail = between_match.groups()
         unit = normalize_unit_text(unit_tail)
+        return {"kind": "between", "lo": float(lo), "hi": float(hi), "unit": unit}
+    return None
+
+
+INLINE_RANGE = re.compile(r"(?P<lo>" + NUM + r")\s*-\s*(?P<hi>" + NUM + r")\s*(?P<unit>[A-Za-z/%^0-9]+)?")
+INLINE_THRESH = re.compile(r"(?P<op><=|<|>=|>)\s*(?P<val>" + NUM + r")\s*(?P<unit>[A-Za-z/%^0-9]+)?")
+
+def parse_inline_range(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    # normalize unicode dashes in-place
+    cleaned = text.replace("\u2013", "-").replace("\u2014", "-")
+    m = INLINE_THRESH.search(cleaned)
+    if m:
+        op = m.group("op")
+        val = m.group("val")
+        unit = normalize_unit_text(m.group("unit") or "")
+        mapping = {"<=": "lte", "<": "lt", ">=": "gte", ">": "gt"}
+        return {"kind": mapping[op], "v": float(val), "unit": unit}
+    m = INLINE_RANGE.search(cleaned)
+    if m:
+        lo = m.group("lo")
+        hi = m.group("hi")
+        unit = normalize_unit_text(m.group("unit") or "")
         return {"kind": "between", "lo": float(lo), "hi": float(hi), "unit": unit}
     return None
 
@@ -176,11 +223,81 @@ def compare_to_range(value: float, reference: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def parse_lab_text(text: str) -> Dict[str, Any]:
+def _heuristic_confidence(tests: List[Dict[str, Any]]) -> float:
+    if not tests:
+        return 0.0
+    valid = [t for t in tests if t.get("name") and t.get("value") not in (None, "")]
+    if not valid:
+        return 0.0
+    units = sum(1 for t in valid if t.get("unit"))
+    statuses = sum(
+        1 for t in valid if (t.get("status") or "").lower() in ("high", "low", "normal")
+    )
+    base = (len(valid) / max(1, len(tests))) * 0.7
+    unit_bonus = (units / max(1, len(valid))) * 0.2
+    status_bonus = (statuses / max(1, len(valid))) * 0.1
+    return round(min(1.0, base + unit_bonus + status_bonus), 2)
+
+
+def _has_key_fields(tests: List[Dict[str, Any]]) -> bool:
+    return any(t.get("name") and t.get("value") not in (None, "") for t in tests)
+
+
+VALUE_UNIT_INLINE = re.compile(
+    r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?:\s*(?P<unit>[A-Za-z/%\^][A-Za-z0-9/%\^]*))?"
+)
+
+
+def _extract_tests_from_entities(text: str, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not entities:
+        return []
+    terms = []
+    for item in entities:
+        term = (item.get("text") or item.get("term") or item.get("word") or "").strip()
+        if term:
+            terms.append(term)
+
+    tests: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        lowered = line.lower()
+        for term in terms:
+            if term.lower() not in lowered:
+                continue
+            match = VALUE_UNIT_INLINE.search(line)
+            if not match:
+                continue
+            value = (match.group("value") or "").replace(",", "")
+            if not value:
+                continue
+            unit = normalize_unit_text((match.group("unit") or "").strip())
+            status = detect_status(line) or "unspecified"
+            key = (term.lower(), value, unit)
+            if key in seen:
+                continue
+            seen.add(key)
+            tests.append(
+                {
+                    "name": term,
+                    "value": value,
+                    "unit": unit,
+                    "status": status,
+                    "reference": None,
+                    "source": "ner",
+                }
+            )
+    return tests
+
+
+def parse_lab_heuristics(text: str) -> Dict[str, Any]:
     tests: List[Dict[str, Any]] = []
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     for line in lines:
+        line = line.replace("\u2013", "-").replace("\u2014", "-")
         match = ROW_PATTERN.match(line)
         if not match:
             continue
@@ -205,10 +322,16 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
         except ValueError:
             continue
 
-        unit = normalize_unit_text(unit_tok) or name_unit or ""
-        status = detect_flag(val_tok) or detect_status(rest) or "unspecified"
+        if _looks_like_flag_token(unit_tok):
+            rest = f"{unit_tok} {rest}".strip()
+            unit_tok = ""
 
-        reference = parse_bracket_range(line)
+        unit = normalize_unit_text(unit_tok) or name_unit or ""
+        if not unit:
+            unit = _extract_unit_from_rest(rest)
+        status = detect_flag(val_tok) or detect_flag(rest) or detect_status(rest) or "unspecified"
+
+        reference = parse_bracket_range(line) or parse_inline_range(rest) or parse_inline_range(line)
         if reference:
             if reference.get("unit"):
                 unit = normalize_unit_text(reference["unit"]) or unit
@@ -263,13 +386,52 @@ def parse_lab_text(text: str) -> Dict[str, Any]:
         "conditions": conditions,
         "meta": {
             "engine": "heuristic",
+            "overall_lab_confidence": _heuristic_confidence(tests),
         },
     }
 
 
-__all__ = [
-    "parse_lab_text",
-    "normalize_unit_text",
-    "normalize_text",
-    "detect_conditions",
-]
+def parse_lab_report(text: str) -> Dict[str, Any]:
+    heuristics = parse_lab_heuristics(text)
+    tests = heuristics.get("tests") or []
+    confidence = heuristics.get("meta", {}).get("overall_lab_confidence", 0.0)
+    needs_ner = (not _has_key_fields(tests)) or confidence < 0.5
+
+    if not needs_ner:
+        return heuristics
+
+    ner_out = detect_medical_entities(text)
+    entities = ner_out.get("entities") or []
+    ner_tests = _extract_tests_from_entities(text, entities)
+
+    merged: List[Dict[str, Any]] = list(tests)
+    seen = {(t.get("name", "").lower(), str(t.get("value", "")), t.get("unit", "")) for t in tests}
+    for candidate in ner_tests:
+        key = (candidate["name"].lower(), str(candidate.get("value", "")), candidate.get("unit", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(candidate)
+
+    combined_conf = _heuristic_confidence(merged)
+    meta = dict(heuristics.get("meta") or {})
+    meta.update(
+        {
+            "engine": "heuristic+ner",
+            "overall_lab_confidence": combined_conf,
+            "ner_meta": ner_out.get("meta", {}),
+        }
+    )
+    return {
+        "tests": merged,
+        "conditions": heuristics.get("conditions") or [],
+        "entities": entities,
+        "meta": meta,
+    }
+
+
+def parse_lab_text(text: str) -> Dict[str, Any]:
+    return parse_lab_report(text)
+
+
+__all__ = ["parse_lab_report", "parse_lab_text", "parse_lab_heuristics", "normalize_unit_text", "normalize_text", "detect_conditions"]

@@ -24,6 +24,19 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 GOOGLE_OAUTH_STATE_SECRET = os.getenv("GOOGLE_OAUTH_STATE_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
 GOOGLE_OAUTH_STATE_TTL_SECONDS = int(os.getenv("GOOGLE_OAUTH_STATE_TTL_SECONDS", "600"))
 GOOGLE_OAUTH_ALG = "HS256"
+ALLOWED_EMAIL_DOMAINS = [
+    d.strip().lower()
+    for d in (os.getenv("ALLOWED_EMAIL_DOMAINS") or "gmail.com,yahoo.com,outlook.com,hotmail.com,live.com,icloud.com,aol.com,protonmail.com").split(",")
+    if d.strip()
+]
+
+def _email_domain_allowed(email: str) -> bool:
+    try:
+        domain = email.split("@", 1)[1].lower()
+    except Exception:
+        return False
+    return domain in ALLOWED_EMAIL_DOMAINS
+
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -95,6 +108,8 @@ def _finish_google_oauth(code: str, state: str, request: Request, db: Session) -
     email = idinfo.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Google account has no email")
+    if not _email_domain_allowed(str(email)):
+        raise HTTPException(status_code=400, detail="Email domain is not allowed")
 
     user = db.query(User).filter(User.email == str(email)).first()
     if not user:
@@ -103,11 +118,21 @@ def _finish_google_oauth(code: str, state: str, request: Request, db: Session) -
             name=idinfo.get("name"),
             hashed_password=hash_password(secrets.token_urlsafe(32)),
         )
+        user.email_verified = True
+        user.email_verification_token_hash = None
+        user.email_verification_expires_at = None
+        user.email_verification_sent_at = None
         db.add(user)
         db.commit()
         db.refresh(user)
     elif not user.name and idinfo.get("name"):
         user.name = idinfo.get("name")
+        db.commit()
+    if not user.email_verified:
+        user.email_verified = True
+        user.email_verification_token_hash = None
+        user.email_verification_expires_at = None
+        user.email_verification_sent_at = None
         db.commit()
 
     access = create_access_token({"sub": str(user.id), "email": user.email})
@@ -126,7 +151,7 @@ def _finish_google_oauth(code: str, state: str, request: Request, db: Session) -
 class LoginAny(BaseModel):
     email: EmailStr | None = None
     username: EmailStr | None = None
-    password: str
+    password: constr(min_length=6, max_length=24)
 
 @router.post("/login")
 def login(payload: LoginAny = Body(...), db: Session = Depends(get_db)):
@@ -143,7 +168,7 @@ def login(payload: LoginAny = Body(...), db: Session = Depends(get_db)):
 
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: constr(min_length=6, max_length=128)
+    password: constr(min_length=6, max_length=24)
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -151,6 +176,9 @@ def register(payload: RegisterIn = Body(...), db: Session = Depends(get_db)):
     """Create a new user account.
     Frontend calls this then immediately logs in, so we just return 201 on success.
     """
+    if not _email_domain_allowed(str(payload.email)):
+        raise HTTPException(status_code=400, detail="Email domain is not allowed")
+
     existing = db.query(User).filter(User.email == str(payload.email)).first()
     if existing:
         raise HTTPException(status_code=409, detail="User with this email already exists")
@@ -160,11 +188,14 @@ def register(payload: RegisterIn = Body(...), db: Session = Depends(get_db)):
         hashed_password=hash_password(payload.password),
         name=None,
     )
+    user.email_verified = True
     db.add(user)
     db.commit()
-    refresh = create_refresh_token({"sub": str(user.id), "email": user.email})
-    access = create_access_token({"sub": str(user.id), "email": user.email})
-    return {"status": "created", "access_token": access, "refresh_token": refresh}
+    user.email_verification_token_hash = None
+    user.email_verification_sent_at = None
+    user.email_verification_expires_at = None
+    db.commit()
+    return {"status": "created"}
 
 
 # ---- Email verification scaffold (placeholder) ----
@@ -174,20 +205,14 @@ class VerifyRequest(BaseModel):
 
 @router.post("/request_verification", status_code=status.HTTP_202_ACCEPTED)
 def request_verification(payload: VerifyRequest):
-    """Stub endpoint for requesting a verification email."""
-    # In a production setup, enqueue email with a signed token here.
-    return {
-        "status": "queued",
-        "message": "Verification email flow not yet implemented.",
-        "email": str(payload.email),
-    }
+    """Verification disabled; keep endpoint for compatibility."""
+    return {"status": "disabled", "message": "Email verification is disabled.", "email": str(payload.email)}
 
 
 @router.get("/verify_email")
 def verify_email(token: str):
-    """Stub endpoint for verifying an email token."""
-    # In a production setup, decode token and mark user as verified.
-    return {"status": "pending", "message": "Email verification is not yet implemented.", "token": token}
+    """Verification disabled; keep endpoint for compatibility."""
+    return {"status": "disabled", "message": "Email verification is disabled.", "token": token}
 
 
 class RefreshIn(BaseModel):

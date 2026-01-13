@@ -4,6 +4,7 @@ import { useToastStore } from "../state/toastStore";
 
 export interface ChatResponseCombined {
   conversation_id?: string;
+  conversation_title?: string;
   request_id: string;
   summary?: string;
   user_view?: {
@@ -213,6 +214,7 @@ export const login = async (email: string, password: string): Promise<{ access_t
     const response = await api.post('/api/auth/login', { email, password });
     return response.data;
 };
+
 
 export const getProfile = async (): Promise<any> => {
     const response = await api.get('/api/profile/');

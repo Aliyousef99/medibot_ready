@@ -43,6 +43,7 @@ function ChatView() {
   const lastScopeRef = useRef<string | null>(null);
   const profileLoadedRef = useRef<string | null>(null);
   const [analysisOpen, setAnalysisOpen] = useState(false);
+  const [conversationsLoading, setConversationsLoading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [analysisState, setAnalysisState] = useState<"idle" | "loading" | "error">("idle");
@@ -172,6 +173,7 @@ function ChatView() {
     if (conversationsLoadedRef.current === userKey) return;
     conversationsLoadedRef.current = userKey;
     (async () => {
+      setConversationsLoading(true);
       try {
         const serverConvos: ConversationSummary[] = await listConversations();
         const mapped = serverConvos.map((c) => ({
@@ -201,6 +203,8 @@ function ChatView() {
         }
       } catch (e: any) {
         addToast({ type: "error", message: e?.message || "Could not load conversations." });
+      } finally {
+        setConversationsLoading(false);
       }
     })();
   }, [user, addToast, actions]);
@@ -303,6 +307,7 @@ function ChatView() {
       const targetConversationId = chatResponse.conversation_id || conversationId || activeId || "";
       const replaced =
         Boolean(targetConversationId) && Boolean(activeId) && targetConversationId !== activeId;
+      let nextConversations = conversations;
       if (targetConversationId && targetConversationId !== activeId) {
         if (activeId) {
           actions.replaceConversationId(activeId, targetConversationId);
@@ -311,7 +316,14 @@ function ChatView() {
         }
       }
       if (!replaced && targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
-        actions.setConversations([{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations]);
+        nextConversations = [{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations];
+        actions.setConversations(nextConversations);
+      }
+      if (chatResponse.conversation_title && targetConversationId) {
+        const nextTitle = chatResponse.conversation_title;
+        actions.setConversations(
+          nextConversations.map((c) => (c.id === targetConversationId ? { ...c, title: nextTitle } : c))
+        );
       }
       if (chatResponse.timed_out) {
         addToast({ type: "info", message: "AI timed out; showing local recommendations instead." });
@@ -520,6 +532,7 @@ function ChatView() {
           user={user}
           onProfile={() => actions.setProfileOpen(true)}
           onLogout={() => logout()}
+          loading={conversationsLoading}
           firstRun={firstRun}
         />
       </div>

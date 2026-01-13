@@ -64,16 +64,27 @@ export default function ChatWindow({
   fileBusy,
 }: ChatWindowProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastActiveIdRef = useRef<string | null>(null);
+  const skipNextScrollRef = useRef(false);
 
   useEffect(() => {
+    const activeId = active?.id || null;
+    if (lastActiveIdRef.current !== activeId) {
+      lastActiveIdRef.current = activeId;
+      skipNextScrollRef.current = true;
+    }
     const el = scrollRef.current as any;
     if (!el) return;
+    if (skipNextScrollRef.current) {
+      skipNextScrollRef.current = false;
+      return;
+    }
     if (typeof el.scrollTo === "function") {
       el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     } else {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages.length]);
+  }, [messages.length, active?.id]);
 
   function triageBadge(level?: string) {
     const lv = (level || "").toLowerCase();

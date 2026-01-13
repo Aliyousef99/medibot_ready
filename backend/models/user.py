@@ -54,6 +54,10 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("0"))
+    email_verification_token_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    email_verification_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    email_verification_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

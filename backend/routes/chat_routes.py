@@ -7,6 +7,7 @@ primary chat entrypoint lives in backend/app.py:/api/chat.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
@@ -26,6 +27,13 @@ from backend.services import summarizer
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
+logger = logging.getLogger("medibot")
+
+OFFLINE_TEMPLATE = (
+    "Offline summary (local fallback):\n\n"
+    "{lab_lines}\n\n"
+    "This is an educational summary; please consult a clinician."
+)
 
 class StartChatIn(BaseModel):
     title: Optional[str] = None
@@ -53,8 +61,7 @@ class SendIn(BaseModel):
     message: str
 
 
-def _build_system_prompt(db: Session, conv: Conversation) -> str:
-    # Prefer active lab context; otherwise fall back to latest lab for this user
+def _resolve_lab_payload(db: Session, conv: Conversation) -> Optional[Dict[str, Any]]:
     lab_payload: Optional[Dict[str, Any]] = None
     if conv.active_lab_id:
         lab = db.query(LabReport).filter(LabReport.id == conv.active_lab_id).first()
@@ -69,6 +76,27 @@ def _build_system_prompt(db: Session, conv: Conversation) -> str:
         )
         if latest and latest.structured_json:
             lab_payload = latest.structured_json
+    return lab_payload
+
+
+def _render_offline_reply(lab_payload: Optional[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    tests = (lab_payload or {}).get("tests") or []
+    for item in tests[:10]:
+        name = item.get("name", "Test")
+        value = item.get("value", "?")
+        status = item.get("status", "unspecified")
+        unit = item.get("unit", "")
+        unit_part = f" {unit}" if unit else ""
+        lines.append(f"- Test: {name}, Value: {value}{unit_part}, Status: {status}")
+    if not lines:
+        lines.append("- No lab results were provided in the context.")
+    return OFFLINE_TEMPLATE.format(lab_lines="\n".join(lines))
+
+
+def _build_system_prompt(db: Session, conv: Conversation) -> str:
+    # Prefer active lab context; otherwise fall back to latest lab for this user
+    lab_payload = _resolve_lab_payload(db, conv)
     sys_parts = ["You are a concise health assistant."]
     if lab_payload:
         try:
@@ -107,8 +135,13 @@ async def send_message(
     ]
     try:
         reply = await gemini.generate_chat(system_prompt, history)
-    except Exception:
-        reply = ""
+        if not (reply or "").strip():
+            lab_payload = _resolve_lab_payload(db, conv)
+            reply = _render_offline_reply(lab_payload)
+    except Exception as exc:
+        logger.warning("gemini_generate_chat_failed", extra={"error": str(exc)})
+        lab_payload = _resolve_lab_payload(db, conv)
+        reply = _render_offline_reply(lab_payload)
 
     # Persist assistant message
     amsg = Message(conversation_id=conv.id, user_id=str(current_user.id), role=MessageRole.ASSISTANT, content=str(reply or ""))

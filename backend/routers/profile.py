@@ -25,7 +25,9 @@ def get_profile(
         db.add(prof)
         db.commit()
         db.refresh(prof)
-    return UserProfileOut.model_validate(prof, from_attributes=True)
+    data = UserProfileOut.model_validate(prof, from_attributes=True).model_dump()
+    data["name"] = user.name
+    return data
 
 @router.put("/", response_model=UserProfileOut)
 def upsert_profile(
@@ -47,6 +49,9 @@ def upsert_profile(
     prof.conditions = payload.conditions or []
     prof.medications = payload.medications or []
     prof.notes = payload.notes
+    if payload.name is not None:
+        next_name = payload.name.strip()
+        user.name = next_name or None
     if payload.consent_given is not None:
         prof.consent_given = bool(payload.consent_given)
         if prof.consent_given:
@@ -58,4 +63,6 @@ def upsert_profile(
     db.add(prof)
     db.commit()
     db.refresh(prof)
-    return UserProfileOut.model_validate(prof, from_attributes=True)
+    data = UserProfileOut.model_validate(prof, from_attributes=True).model_dump()
+    data["name"] = user.name
+    return data

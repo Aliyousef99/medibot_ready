@@ -3,3 +3,4 @@ python-dotenv
 # Use prebuilt wheels to avoid compiling libpq/pg_config requirements
 psycopg2-binary==2.9.9
 google-auth
+pdf2image

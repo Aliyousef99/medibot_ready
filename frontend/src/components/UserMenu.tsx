@@ -1,6 +1,6 @@
 // frontend/src/components/UserMenu.tsx
 import { useMemo, useRef, useState, useEffect } from "react";
-import { ChevronUp, ChevronDown, History } from "lucide-react";
+import { ChevronUp, ChevronDown } from "lucide-react";
 
 export type UiUser = {
   email: string;
@@ -64,14 +64,6 @@ export default function UserMenu({
 
       {open && (
         <div className="absolute bottom-14 left-0 right-0 z-50 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-lg p-1">
-          <a
-            href="#/history"
-            onClick={() => setOpen(false)}
-            className="w-full text-left px-3 py-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-900 text-sm flex items-center gap-2"
-          >
-            <History size={16} />
-            History
-          </a>
           <button
             onClick={() => {
               setOpen(false);

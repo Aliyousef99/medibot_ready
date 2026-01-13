@@ -16,6 +16,7 @@ type ConversationListProps = {
   user: User | null;
   onProfile: () => void;
   onLogout: () => void;
+  loading?: boolean;
   firstRun?: boolean;
 };
 
@@ -32,6 +33,7 @@ export default function ConversationList({
   user,
   onProfile,
   onLogout,
+  loading = false,
   firstRun = false,
 }: ConversationListProps) {
   return (
@@ -83,7 +85,6 @@ export default function ConversationList({
               >
                 <MessageSquare className="w-4 h-4 shrink-0" />
                 <span className="flex-1 truncate">{c.title}</span>
-                <span className="text-xs text-zinc-400">{c.messages.length}</span>
                 <span
                   onClick={(e) => {
                     e.stopPropagation();
@@ -95,6 +96,10 @@ export default function ConversationList({
                 </span>
               </button>
             ))
+          ) : loading ? (
+            <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 p-4 text-xs text-zinc-500 text-center">
+              Loading conversations...
+            </div>
           ) : (
             <div className="rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 p-4 text-xs text-zinc-500 text-center">
               No conversations yet.

@@ -1,5 +1,6 @@
 # --- imports (top of backend/app.py) ---
 import os, io, json, base64, re
+import uuid as _uuid
 import pytesseract, httpx
 import sys
 import shutil
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from redis import Redis
 from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, Text as SAText, text as SAtext
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, APIRouter, Request, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, APIRouter, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, constr
@@ -44,6 +45,7 @@ from backend.services.symptom_analysis import analyze_text as analyze_symptom_te
 from backend.services.symptom_events import save_symptom_event
 from backend.services.recommendations import recommend, red_flag_triage, lab_triage
 from backend.routers.profile import router as profile_router
+from backend.utils.app import build_chat_context
 
 # --- app & router setup ---
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or "").strip()
@@ -67,6 +69,15 @@ else:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+
+OFFLINE_SUMMARY_TEMPLATE = """\
+**Offline Mode:**
+We are unable to reach the AI service. Here is your summary based on the extracted data:
+- **Test:** {test_name}
+- **Result:** {value} {unit}
+- **Status:** {status} (Reference Range: {range})
+*Please consult a healthcare professional for verification.*
+"""
 
 app = FastAPI(title="MediBot Backend", version="0.1.0")
 router = APIRouter(prefix="/api")
@@ -120,7 +131,6 @@ try:
     limiter = Limiter(key_func=get_remote_address, default_limits=[])
     app.state.limiter = limiter
 
-    app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(SlowAPIMiddleware)
 
     # Provide a reset hook for tests
@@ -269,6 +279,7 @@ def _maybe_seed_demo_user() -> None:
                 hashed_password=hash_password(password),
                 name=name,
             )
+            user.email_verified = True
             db.add(user)
             db.commit()
     except Exception:
@@ -346,6 +357,7 @@ class ChatIn(BaseModel):
 
 class ChatOut(BaseModel):
     conversation_id: Optional[str] = None
+    conversation_title: Optional[str] = None
     request_id: str
     summary: Optional[str] = ""
     symptom_analysis: Dict[str, Any]
@@ -453,149 +465,9 @@ def detect_conditions(text: str) -> List[str]:
     return sorted(list(set(found)))
 
 def parse_lab_text(text: str) -> Dict[str, Any]:
-    # Pre-normalize noisy OCR/HTML text before any extraction
-    def _normalize_ocr_text(s: str) -> str:
-        try:
-            # HTML entities and angle variants
-            s = s.replace("&lt;=", "<=").replace("&gt;=", ">=")
-            s = s.replace("&lt;", "<").replace("&gt;", ">")
-            s = s.replace("&amp;", "&")
-            # Fix tokens like 1270H.1 -> 1270.1 H (preserve H/L semantics explicitly)
-            s = re.sub(r"(?i)(\b\d+)([HL])\.(\d+\b)", r"\1.\3 \2", s)
-            # Collapse stray trailing periods on numeric tokens: 4.7. -> 4.7, 181. -> 181
-            s = re.sub(r"(\b\d+(?:\.\d+)?)(\.)\b", r"\1", s)
-            # Normalize whitespace
-            s = re.sub(r"[\t\r]+", " ", s)
-            s = re.sub(r"\u00A0", " ", s)  # non-breaking space
-            # Normalize line endings and trim excessive internal spaces
-            lines = []
-            for ln in s.splitlines():
-                lines.append(re.sub(r"\s+", " ", ln).strip())
-            return "\n".join(ln for ln in lines if ln)
-        except Exception:
-            return s
+    from backend.services.lab_parser import parse_lab_report
 
-    original_text = text
-    text = _normalize_ocr_text(text)
-    pipeline, model_name, init_warning = get_ner_pipeline()
-    entities_raw: List[Dict[str, Any]] = []
-    entities_formatted: List[Dict[str, Any]] = []
-    ner_error: Optional[str] = None
-
-    if pipeline is not None:
-        try:
-            # Enforce max length to avoid oversized inputs
-            ner_input = text[:NER_MAX_CHARS]
-            entities_raw = _run_ner_with_timeout(pipeline, ner_input, timeout=NER_TIMEOUT_SECONDS)
-            entities_formatted = format_entities(entities_raw)
-        except Exception as err:  # pragma: no cover - runtime inference issues
-            ner_error = f"NER inference failed: {err}"
-            entities_raw = []
-    else:
-        ner_error = init_warning or "NER pipeline unavailable"
-
-    tests = extract_tests_from_entities(text, entities_raw)
-
-    heuristics_data: Optional[Dict[str, Any]] = None
-
-    if not tests:
-        heuristics_data = _parse_lab_text_heuristic(text)
-        meta = heuristics_data["meta"].copy()
-        if model_name:
-            meta["ner_model"] = model_name
-        if init_warning:
-            meta["ner_warning"] = init_warning
-        if ner_error and ner_error != init_warning:
-            meta["ner_error"] = ner_error
-        if not meta.get("engine"):
-            meta["engine"] = "heuristic-fallback"
-
-        # Compute a quick overall confidence for labs parsed via heuristics
-        try:
-            confs = [t.get("confidence", 0.5) for t in heuristics_data.get("tests", []) if t.get("unit") or t.get("ref_min") or t.get("ref_max")]
-            overall_conf = round(sum(confs)/max(1, len(confs)), 2)
-        except Exception:
-            overall_conf = 0.5
-
-        out = {
-            "tests": heuristics_data["tests"],
-            "conditions": heuristics_data["conditions"],
-            "entities": entities_formatted,
-            "meta": {**meta, "overall_lab_confidence": overall_conf, "cleaned_text": text},
-        }
-        try:
-            abnormal_count = sum(1 for t in heuristics_data.get("tests", []) if t.get("abnormal") in ("high", "low"))
-            logger.info({
-                "function": "lab_parse_summary",
-                "parsed_count": len(heuristics_data.get("tests", [])),
-                "abnormal_count": abnormal_count,
-                "overall_lab_confidence": overall_conf,
-            })
-        except Exception:
-            pass
-        return out
-
-    conditions = detect_conditions(text)
-    engine = "huggingface-biobert"
-    note = "Values derived by aligning BioBERT entities with table parser."
-    if model_name and model_name != BIOBERT_MODEL_NAME:
-        engine = "huggingface-ner-fallback"
-        note = "BioBERT unavailable; using fallback HuggingFace NER model."
-
-    meta: Dict[str, Any] = {
-        "engine": engine,
-        "ner_model": model_name,
-        "note": note,
-    }
-    if init_warning and model_name == NER_FALLBACK_MODEL_NAME:
-        meta["ner_warning"] = init_warning
-    if ner_error and ner_error != init_warning:
-        meta["ner_warning"] = ner_error
-
-    heuristics_data = heuristics_data or _parse_lab_text_heuristic(text)
-    seen_keys: Set[Tuple[str, str, str]] = {
-        (t["name"].lower(), t["value"], t.get("unit", "")) for t in tests
-    }
-    supplemented = False
-    for candidate in heuristics_data["tests"]:
-        key = (candidate["name"].lower(), candidate["value"], candidate.get("unit", ""))
-        if key in seen_keys:
-            continue
-        tests.append(candidate)
-        seen_keys.add(key)
-        supplemented = True
-
-    if supplemented:
-        meta["supplemented_with"] = "heuristic-fallback"
-        # Combine any condition hints discovered during heuristic pass
-        heuristic_conditions = heuristics_data["conditions"]
-        combined = sorted(set(conditions) | set(heuristic_conditions))
-        conditions = combined
-
-    # Compute a quick overall confidence for labs parsed via NER+heuristics tests
-    try:
-        confs = [t.get("confidence", 0.5) for t in tests if t.get("unit") or t.get("ref_min") or t.get("ref_max")]
-        overall_conf = round(sum(confs)/max(1, len(confs)), 2)
-    except Exception:
-        overall_conf = 0.5
-
-    out = {
-        "tests": tests,
-        "conditions": conditions,
-        "entities": entities_formatted,
-        "meta": {**meta, "overall_lab_confidence": overall_conf, "cleaned_text": text},
-    }
-    try:
-        abnormal_count = sum(1 for t in tests if t.get("abnormal") in ("high", "low"))
-        logger.info({
-            "function": "lab_parse_summary",
-            "parsed_count": len(tests),
-            "abnormal_count": abnormal_count,
-            "overall_lab_confidence": overall_conf,
-        })
-    except Exception:
-        pass
-    return out
+    return parse_lab_report(text)
 # -------------------- Routes --------------------
 
 NER_FALLBACK_MODEL_NAME = (os.getenv("NER_FALLBACK_MODEL") or "dslim/bert-base-NER").strip() or "dslim/bert-base-NER"
@@ -1284,6 +1156,53 @@ def _persist_message(db: Session, conv: Conversation, user: User, role: MessageR
         raise
     return msg
 
+def _should_auto_title(current_title: Optional[str], first_message: str) -> bool:
+    if not current_title or not current_title.strip():
+        return True
+    title = current_title.strip()
+    if title.lower() in {"new chat", "new chat...", "new chat…"}:
+        return True
+    raw = (first_message or "").strip()
+    if not raw:
+        return False
+    truncated = raw[:60] + ("..." if len(raw) > 60 else "")
+    return title == raw or title == truncated
+
+async def _generate_chat_title(message: str) -> str:
+    raw = (message or "").strip()
+    if not raw:
+        return "New chat"
+    if not AI_EXPLANATION_ENABLED or not GEMINI_API_KEY:
+        return raw[:60] + ("..." if len(raw) > 60 else "")
+    prompt = (
+        "Create a short chat title (max 5 words) based on this user message. "
+        "Return only the title, no quotes or punctuation.\n\n"
+        f"{raw}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+            r = await client.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"role": "user", "parts": [{"text": prompt.strip()}]}]},
+            )
+            r.raise_for_status()
+            data = r.json()
+            title = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                or ""
+            ).strip()
+            if title:
+                return title[:60]
+    except Exception:
+        pass
+    return raw[:60] + ("..." if len(raw) > 60 else "")
+
 
 @app.post("/api/chat", response_model=ChatOut)
 # Relax rate limits to support continuous chat sessions
@@ -1347,11 +1266,17 @@ async def chat(
         cleaned = re.sub(r"\bCholesterolTotal\b", "Total Cholesterol", cleaned)
         cleaned = re.sub(r"\bTriglyceride\b", "Triglycerides", cleaned)
 
-        # Trigger condition: long text AND contains unit token OR bracketed range
-        long_enough = len(cleaned) >= 200
-        has_unit = bool(re.search(r"(?i)\b(ng/mL|mmol/L|mg/dL)\b", cleaned))
+        # Trigger condition: lab-like lines with values/units or reference ranges
+        lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+        line_count = len(lines)
+        has_unit = bool(re.search(r"(?i)\b(ng/mL|mmol/L|mg/dL|g/dL|u/l|u/l|iu/l|%|x?10\^)\b", cleaned))
         has_brackets = ("[" in cleaned and "]" in cleaned)
-        if long_enough and (has_unit or has_brackets):
+        has_ref_word = bool(re.search(r"(?i)\bref(?:erence)?\b", cleaned))
+        looks_like_table = any(
+            re.search(r"\d", ln) and (("[" in ln and "]" in ln) or re.search(r"(?i)\bref\b", ln) or re.search(r"(?i)\b(ng/mL|mmol/L|mg/dL|g/dL|u/l|iu/l|%|x?10\^)\b", ln))
+            for ln in lines
+        )
+        if (line_count >= 2 and (has_unit or has_brackets or has_ref_word or looks_like_table)) or looks_like_table:
             # Prefer dedicated inline parser if available
             inline_result: Optional[Dict[str, Any]] = None
             try:
@@ -1403,10 +1328,11 @@ async def chat(
 
             parsed_n = len((structured_json.get("analytes") or [])) if isinstance(structured_json, dict) else 0
             abnormal_n = len((presentation.get("abnormal") or [])) if isinstance(presentation, dict) else 0
+            normal_n = len((presentation.get("normal") or [])) if isinstance(presentation, dict) else 0
             conf = float(presentation.get("confidence") or 0.0) if isinstance(presentation, dict) else 0.0
 
             # Build user_view for UI consumption when we have parsed lines
-            if parsed_n >= 1:
+            if parsed_n >= 1 or (abnormal_n + normal_n) >= 2:
                 summary_txt = f"Parsed {parsed_n} line(s); {abnormal_n} abnormal."
                 # Append received date if present in the raw text as "ReceivedDate/Time dd/mm/yyyy"
                 try:
@@ -2174,6 +2100,19 @@ async def chat(
             pass
         logger.warning("db_persist_assistant_message_failed", exc_info=True)
 
+    try:
+        if _should_auto_title(getattr(conv, "title", None), payload.message or ""):
+            new_title = await _generate_chat_title(payload.message or "")
+            if new_title and new_title != conv.title:
+                conv.title = new_title
+                db.add(conv)
+                db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     # Final integrity log before return: keys present in payload
     try:
         top_keys = [
@@ -2194,6 +2133,7 @@ async def chat(
 
     return ChatOut(
         conversation_id=str(conv.id),
+        conversation_title=conv.title,
         request_id=request_id,
         summary=summary,
         symptom_analysis=symptom_analysis,
@@ -2209,11 +2149,191 @@ async def chat(
     )
 
 
+@app.post("/api/chat/image", response_model=ChatOut)
+@limiter.limit("30/minute", key_func=user_rate_key)
+async def chat_image(
+    request: Request,
+    file: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        request.state.user_id = str(user.id)
+    except Exception:
+        pass
+
+    mt = (file.content_type or "").lower()
+    if not mt.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload a JPG or PNG image.")
+
+    data = await file.read()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_FILE_MB:
+        raise HTTPException(status_code=413, detail=f"File size exceeds the {MAX_FILE_MB}MB limit")
+
+    request_id = str(_uuid.uuid4())
+    user_text = "Uploaded lab image."
+
+    conv = _ensure_conversation(db, user, conversation_id, user_text)
+    try:
+        append_chat_history(str(user.id), "user", user_text)
+    except Exception:
+        pass
+    try:
+        _persist_message(db, conv, user, MessageRole.USER, user_text)
+    except Exception:
+        logger.warning("db_persist_user_message_failed", exc_info=True)
+
+    context, _notice = build_chat_context(db, user, user_text)
+    prompt = (
+        "You are a helpful medical assistant. Analyze the attached lab report image. "
+        "Extract all tests with value, unit, reference range (if visible), and flag high/low/normal when possible. "
+        "Then provide a concise summary and a plain-language explanation. "
+        "Avoid diagnosis or prescriptions; include caveats and when to seek care.\n\n"
+        f"{context}\n"
+    )
+
+    ai_explanation = ""
+    ai_explanation_source = "skipped"
+    timed_out = False
+
+    if not AI_EXPLANATION_ENABLED:
+        ai_explanation = "AI explanation disabled by config."
+        ai_explanation_source = "skipped"
+    elif not GEMINI_API_KEY:
+        ai_explanation = "AI explanation skipped: model not configured."
+        ai_explanation_source = "skipped"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+                payload = {
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": prompt.strip()},
+                                {
+                                    "inline_data": {
+                                        "mime_type": mt,
+                                        "data": base64.b64encode(data).decode("ascii"),
+                                    }
+                                },
+                            ],
+                        }
+                    ]
+                }
+                r = await client.post(
+                    url,
+                    params={"key": GEMINI_API_KEY},
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                )
+                r.raise_for_status()
+                data = r.json()
+                ai_explanation = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    or ""
+                ).strip()
+                ai_explanation_source = "model"
+        except httpx.TimeoutException:
+            timed_out = True
+            ai_explanation_source = "fallback"
+            ai_explanation = "AI explanation unavailable; please try again."
+        except Exception:
+            timed_out = False
+            ai_explanation_source = "fallback"
+            ai_explanation = "AI explanation unavailable; please try again."
+
+    if not ai_explanation:
+        ai_explanation = "AI explanation unavailable; please try again."
+        ai_explanation_source = "fallback"
+
+    try:
+        append_chat_history(str(user.id), "assistant", ai_explanation or "")
+    except Exception:
+        pass
+    try:
+        _persist_message(db, conv, user, MessageRole.ASSISTANT, ai_explanation or "")
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning("db_persist_assistant_message_failed", exc_info=True)
+
+    try:
+        if _should_auto_title(getattr(conv, "title", None), user_text):
+            title_seed = ai_explanation if ai_explanation_source == "model" else "Lab image analysis"
+            new_title = await _generate_chat_title(title_seed)
+            if new_title and new_title != conv.title:
+                conv.title = new_title
+                db.add(conv)
+                db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    symptom_analysis = {"symptoms": [], "possible_tests": [], "confidence": 0.0, "event_id": None}
+    local_recs = {
+        "priority": "low",
+        "actions": ["Monitor symptoms and rest"],
+        "follow_up": "If symptoms persist >48h, worsen, or include red flags (fainting, chest pain), seek medical care.",
+        "rationale": "Initial self-care suggestions based on reported symptoms.",
+    }
+    disclaimer = "For educational purposes only. Consult a medical professional for medical advice."
+
+    return ChatOut(
+        conversation_id=str(conv.id),
+        conversation_title=conv.title,
+        request_id=request_id,
+        summary="Image analyzed.",
+        symptom_analysis=symptom_analysis,
+        local_recommendations=local_recs,
+        ai_explanation=ai_explanation,
+        ai_explanation_source=ai_explanation_source,
+        timed_out=timed_out,
+        disclaimer=disclaimer,
+        pipeline=None,
+        missing_fields=None,
+        triage=None,
+        user_view=None,
+    )
+
+
 
 @router.post("/explain", response_model=ExplainOut)
 @limiter.limit("2/minute")
 async def explain(request: Request, payload: ExplainIn, db: Session = Depends(get_db), user: User = Depends(get_current_user), response: Response = None) -> ExplainOut:
     structured = payload.structured
+    def _format_range(test: Dict[str, Any]) -> str:
+        if test.get("ref_min") is not None or test.get("ref_max") is not None:
+            ref_min = test.get("ref_min")
+            ref_max = test.get("ref_max")
+            if ref_min is not None and ref_max is not None:
+                return f"{ref_min}-{ref_max}"
+            if ref_min is not None:
+                return f">= {ref_min}"
+            if ref_max is not None:
+                return f"<= {ref_max}"
+        ref = test.get("reference")
+        if isinstance(ref, dict):
+            kind = ref.get("kind")
+            if kind == "between":
+                return f"{ref.get('lo')}-{ref.get('hi')}"
+            if kind in ("lt", "lte"):
+                op = "<=" if kind == "lte" else "<"
+                return f"{op} {ref.get('v')}"
+            if kind in ("gt", "gte"):
+                op = ">=" if kind == "gte" else ">"
+                return f"{op} {ref.get('v')}"
+        return "N/A"
 
     # fallback if no key
     if not GEMINI_API_KEY:
@@ -2332,7 +2452,16 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
             return ExplainOut(explanation=final, lab_report_id=str(lr.id))
     except Exception as e:
         logger.exception("explain failed")
-        return ExplainOut(explanation=f"⚠️ Gemini error: {e}")
+        tests = structured.get("tests") or []
+        first = tests[0] if tests else {}
+        offline_summary = OFFLINE_SUMMARY_TEMPLATE.format(
+            test_name=first.get("name", "Test"),
+            value=first.get("value", "?"),
+            unit=first.get("unit", ""),
+            status=first.get("status", "unspecified"),
+            range=_format_range(first),
+        )
+        return ExplainOut(explanation=offline_summary)
 
 # --- Conversation list/history endpoints ---
 @router.get("/chat/conversations", response_model=List[ConversationOut])
