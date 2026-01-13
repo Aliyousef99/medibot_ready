@@ -6,7 +6,7 @@ import ProfileModal from "./ProfileModal";
 import ConversationList from "./ConversationList";
 import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
-import { postChatMessage as apiChat, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent } from "../services/api";
+import { postChatMessage as apiChat, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent, getProfile as apiGetProfile } from "../services/api";
 import type { ChatResponseCombined, ConversationSummary, ConversationMessageRow } from "../services/api";
 import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
@@ -41,7 +41,8 @@ function ChatView() {
   const { user, setUser, logout } = useAuth();
   const { add: addToast } = useToastStore();
   const lastScopeRef = useRef<string | null>(null);
-  const [analysisOpen, setAnalysisOpen] = useState(true);
+  const profileLoadedRef = useRef<string | null>(null);
+  const [analysisOpen, setAnalysisOpen] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [analysisState, setAnalysisState] = useState<"idle" | "loading" | "error">("idle");
@@ -109,6 +110,26 @@ function ChatView() {
   }, [user, actions]);
 
   useEffect(() => {
+    if (!user) return;
+    if (user.profile?.name) {
+      profileLoadedRef.current = String(user.id || user.email || "");
+      return;
+    }
+    const key = String(user.id || user.email || "");
+    if (!key || profileLoadedRef.current === key) return;
+    profileLoadedRef.current = key;
+    (async () => {
+      try {
+        const profile = await apiGetProfile();
+        if (!profile) return;
+        setUser({ ...user, profile });
+      } catch {
+        // best-effort profile hydration
+      }
+    })();
+  }, [user, setUser]);
+
+  useEffect(() => {
     if (dark) document.documentElement.classList.add("dark");
     else document.documentElement.classList.remove("dark");
   }, [dark]);
@@ -124,6 +145,7 @@ function ChatView() {
   // Encourage profile completion on first load based on stored profile data
   useEffect(() => {
     if (!user) return;
+    if (hideProfileBanner) return;
     const p: any = user.profile || {};
     const missing: string[] = [];
     if (p.age === undefined || p.age === null || p.age === "") missing.push("age");
@@ -347,6 +369,15 @@ function ChatView() {
   }
 
   async function onFilePicked(file: File) {
+    const allowedTypes = new Set(["application/pdf", "image/jpeg", "image/png"]);
+    const ext = (file.name || "").toLowerCase().split(".").pop() || "";
+    const allowedExts = new Set(["pdf", "jpg", "jpeg", "png"]);
+    const hasAllowedType = allowedTypes.has(file.type);
+    const hasAllowedExt = allowedExts.has(ext);
+    if (!hasAllowedType && !hasAllowedExt) {
+      addToast({ type: "error", message: "Unsupported file type. Please upload a PDF or JPG/PNG image." });
+      return;
+    }
     actions.setFileBusy(true);
     setUploadStatus("loading");
     setUploadError(null);

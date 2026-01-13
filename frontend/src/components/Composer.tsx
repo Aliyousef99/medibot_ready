@@ -62,6 +62,7 @@ export default function Composer({
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const listeningBaseRef = useRef<string>("");
   const latestInputRef = useRef<string>(input);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);
   const [voiceError, setVoiceError] = useState<string | null>(null);
@@ -74,6 +75,23 @@ export default function Composer({
 
   useEffect(() => {
     latestInputRef.current = input;
+  }, [input]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || typeof window === "undefined") return;
+    el.style.height = "auto";
+    const styles = window.getComputedStyle(el);
+    const fontSize = Number.parseFloat(styles.fontSize || "0");
+    const rawLineHeight = Number.parseFloat(styles.lineHeight || "");
+    const lineHeight = Number.isFinite(rawLineHeight) && rawLineHeight > 0 ? rawLineHeight : fontSize * 1.4;
+    const paddingTop = Number.parseFloat(styles.paddingTop || "0");
+    const paddingBottom = Number.parseFloat(styles.paddingBottom || "0");
+    const maxLines = 10;
+    const maxHeight = Math.ceil(lineHeight * maxLines + paddingTop + paddingBottom);
+    const nextHeight = Math.min(el.scrollHeight, maxHeight);
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
   }, [input]);
 
   useEffect(() => {
@@ -160,7 +178,7 @@ export default function Composer({
     <div className="px-4 lg:px-6 py-3 bg-gradient-to-t from-zinc-50 via-zinc-50/90 to-transparent dark:from-zinc-900 dark:via-zinc-900/90">
       <div className="mx-auto max-w-3xl">
         <div className="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm p-2">
-          <div className="flex items-end gap-2">
+          <div className="flex items-center gap-2">
             <label
               className={`shrink-0 inline-flex items-center justify-center rounded-xl p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${
                 fileBusy ? "animate-pulse" : ""
@@ -171,6 +189,7 @@ export default function Composer({
               <input
                 type="file"
                 className="hidden"
+                accept=".pdf,.jpg,.jpeg,.png"
                 ref={uploadInputRef}
                 onChange={(e) => e.target.files && onFilePicked(e.target.files[0])}
                 disabled={fileBusy}
@@ -179,12 +198,13 @@ export default function Composer({
             </label>
 
             <textarea
+              ref={textareaRef}
               value={input}
               onChange={(e) => onInputChange(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
               placeholder={fileBusy ? "Extracting text from file..." : "Paste lab text or type your question..."}
-              className="flex-1 max-h-40 h-12 resize-none bg-transparent px-2 py-2 outline-none placeholder:text-zinc-400 text-sm"
+              className="flex-1 min-h-[3rem] resize-none bg-transparent px-2 py-2 outline-none placeholder:text-zinc-400 text-sm"
               disabled={fileBusy}
             />
 

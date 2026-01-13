@@ -117,7 +117,7 @@ export default function ConversationList({
         </div>
 
         <div className="shrink-0 border-t border-zinc-200 dark:border-zinc-800 p-3">
-          <UserMenu user={{ email: user?.email || "" }} onProfile={onProfile} onLogout={onLogout} />
+          <UserMenu user={{ email: user?.email || "", profile: user?.profile }} onProfile={onProfile} onLogout={onLogout} />
         </div>
       </div>
     </aside>

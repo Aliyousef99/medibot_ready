@@ -14,6 +14,7 @@ type ProfileModalProps = {
 };
 
 export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileModalProps) {
+  const [name, setName] = useState("");
   const [age, setAge] = useState<number | "">("");
   const [sex, setSex] = useState("");
   const [conditions, setConditions] = useState("");
@@ -29,6 +30,7 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
   useEffect(() => {
     if (!open) return;
     const p = user.profile || {};
+    setName(p.name ?? "");
     setAge(p.age ?? "");
     setSex(p.sex ?? "");
     setConditions(Array.isArray(p.conditions) ? p.conditions.join(", ") : "");
@@ -79,6 +81,11 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
       addToast({ type: "error", message: "Please enter a valid age between 1 and 120." });
       return;
     }
+    const trimmedName = name.trim();
+    if (trimmedName.length > 120) {
+      addToast({ type: "error", message: "Please keep your name under 120 characters." });
+      return;
+    }
     const normConditions = conditions
       ? conditions.split(",").map((s) => s.trim()).filter(Boolean)
       : [];
@@ -90,6 +97,7 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
     setMsg(null);
     try {
       const updated = await apiUpdateProfile({
+        name: trimmedName || null,
         age: age === "" ? null : Number(age),
         sex: sex || null,
         conditions: normConditions,
@@ -141,6 +149,18 @@ export default function ProfileModal({ open, onClose, user, onUpdate }: ProfileM
         </div>
 
         <div className="space-y-4">
+          <label className="text-sm text-zinc-600 dark:text-zinc-300 space-y-1">
+            <span className="block font-medium">Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g., Alex Johnson"
+              className="w-full rounded-lg border px-3 py-2 bg-white dark:bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+              maxLength={120}
+            />
+            <span className="text-[12px] text-zinc-400">Shown in your profile and sidebar.</span>
+          </label>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <label className="text-sm text-zinc-600 dark:text-zinc-300 space-y-1">
               <span className="block font-medium">Age</span>

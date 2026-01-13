@@ -1,4 +1,7 @@
 import React, { useMemo, useState } from 'react';
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import type { ChatResponseCombined } from '../services/api';
 
 type Props = {
@@ -171,9 +174,11 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
       {usingUV && (fullExplanation || brief) && (
         <div className="mt-3">
           <div className="font-medium">Explanation</div>
-          <p className="text-sm text-zinc-700 dark:text-zinc-300 leading-snug whitespace-pre-wrap">
-            {fullExplanation || brief}
-          </p>
+          <div className="prose prose-sm dark:prose-invert max-w-none text-sm text-zinc-700 dark:text-zinc-300 leading-snug">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]}>
+              {fullExplanation || brief}
+            </ReactMarkdown>
+          </div>
         </div>
       )}
 
