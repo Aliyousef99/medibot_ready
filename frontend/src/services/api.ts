@@ -286,6 +286,14 @@ export const postChatMessage = async (message: string, conversationId?: string):
   return response.data as ChatResponseCombined;
 };
 
+export const postChatImage = async (file: File, conversationId?: string): Promise<ChatResponseCombined> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  if (conversationId) formData.append('conversation_id', conversationId);
+  const response = await api.post('/api/chat/image', formData);
+  return response.data as ChatResponseCombined;
+};
+
 // ---------- History (Labs) ----------
 
 export const getHistory = async (): Promise<LabReport[]> => {

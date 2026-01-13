@@ -42,7 +42,9 @@ export default function ChatMessage({ msg, devMode }: ChatMessageProps) {
   const isUser = msg.role === "user";
   const [copied, setCopied] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [showImage, setShowImage] = useState(false);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const imageUrl = msg.imageUrl;
   const safe = useMemo(
     () => DOMPurify.sanitize(msg.content, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }),
     [msg.content]
@@ -63,6 +65,18 @@ export default function ChatMessage({ msg, devMode }: ChatMessageProps) {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!showImage) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setShowImage(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [showImage]);
 
   async function handleCopy() {
     try {
@@ -120,7 +134,24 @@ export default function ChatMessage({ msg, devMode }: ChatMessageProps) {
         }`}
       >
         {isUser ? (
-          <div>{safe}</div>
+          <div className="space-y-2">
+            {imageUrl && (
+              <button
+                type="button"
+                className="inline-flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-400 rounded-xl"
+                onClick={() => setShowImage(true)}
+                aria-label="Open uploaded image"
+                title="Open image"
+              >
+                <img
+                  src={imageUrl}
+                  alt="Uploaded lab"
+                  className="max-h-72 w-auto rounded-xl border border-zinc-200 dark:border-zinc-800"
+                />
+              </button>
+            )}
+            <div>{safe}</div>
+          </div>
         ) : hasUserView ? (
           <LabSummaryCard response={msg.rawResponse} aiText={msg.content} devMode={!!devMode} />
         ) : (
@@ -189,6 +220,33 @@ export default function ChatMessage({ msg, devMode }: ChatMessageProps) {
           </div>
         )}
       </div>
+      {showImage && imageUrl && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image preview"
+          onMouseDown={(e) => {
+            if (e.currentTarget === e.target) setShowImage(false);
+          }}
+        >
+          <div className="relative max-h-[90vh] max-w-[90vw]">
+            <button
+              type="button"
+              className="absolute -top-3 -right-3 rounded-full bg-white text-zinc-900 w-8 h-8 shadow flex items-center justify-center"
+              onClick={() => setShowImage(false)}
+              aria-label="Close image preview"
+            >
+              &times;
+            </button>
+            <img
+              src={imageUrl}
+              alt="Uploaded lab full size"
+              className="max-h-[90vh] max-w-[90vw] rounded-xl border border-zinc-200 dark:border-zinc-800"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

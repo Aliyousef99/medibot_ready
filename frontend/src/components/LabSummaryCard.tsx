@@ -16,20 +16,58 @@ function parseAnalytesFromText(text?: string): Analyte[] {
   if (!text) return [];
   const lines = (text.split(/\n|\r/).map(l => l.trim()).filter(Boolean));
   const out: Analyte[] = [];
-  const rx = /^([A-Za-z][A-Za-z\s/]+?)\s[—-]\s*([0-9]+(?:\.[0-9]+)?)\s*([^()\s]+)?\s*\(([^)]*)\)\s*$/;
+  const seen = new Set<string>();
+  const rx = /^([A-Za-z][A-Za-z\s/]+?)\s[--]\s*([0-9]+(?:\.[0-9]+)?)\s*([^()\s]+)?\s*\(([^)]*)\)\s*$/;
+  const rxAlt = /^([A-Za-z][A-Za-z\s/().%-]+?)\s*[:\-]\s*([0-9]+(?:\.\d+)?)\s*([A-Za-z/%^0-9]+)?\s*\(([^)]*)\)\s*$/;
+  const rxInline = /^([A-Za-z][A-Za-z\s/().%-]+?)\s+([0-9]+(?:\.\d+)?)\s*([A-Za-z/%^0-9]+)?\s*\(([^)]*)\)\s*$/;
+  const rxNarrative = /\b(High|Low)\s+([A-Za-z][A-Za-z0-9 ./()%\-]+?)\s*\((\d+(?:\.\d+)?)\s*([A-Za-z/%^0-9]+)?\)/gi;
+  const rxNarrativeParen = /\b(High|Low)\s+([A-Za-z][A-Za-z0-9 ./()%\-]+?\([^)]*\))\s*\((\d+(?:\.\d+)?)\s*([A-Za-z/%^0-9]+)?\)/gi;
+  const rxValueParen = /([A-Za-z][A-Za-z0-9 ./()%\-]+?)\s*\((\d+(?:\.\d+)?)\s*([A-Za-z/%^0-9]+)?\)/g;
+
+  const pushItem = (nameRaw: string, val: string, unit?: string, status?: string, ref?: string) => {
+    const name = nameRaw.trim();
+    const value = val.trim();
+    const unitClean = (unit || "").trim();
+    const key = `${name.toLowerCase()}|${value}|${unitClean}|${status || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, value, unit: unitClean || undefined, status, ref });
+  };
+
   for (const ln of lines) {
-    const m = ln.match(rx);
+    const m = ln.match(rx) || ln.match(rxAlt) || ln.match(rxInline);
     if (!m) continue;
     const [, nameRaw, val, unit, inside] = m;
-    const name = nameRaw.trim();
     const statusMatch = inside.match(/(High|Low|Normal|Desirable)/i);
     const status = statusMatch ? statusMatch[1][0].toUpperCase() + statusMatch[1].slice(1).toLowerCase() : undefined;
-    // grab any reference text after a ';' or starting with 'ref'
     let ref = '';
     const semi = inside.indexOf(';');
     if (semi >= 0) ref = inside.slice(semi + 1).trim();
     else if (/ref/i.test(inside)) ref = inside.trim();
-    out.push({ name, value: val, unit, status, ref });
+    pushItem(nameRaw, val, unit, status, ref);
+  }
+
+  const sentences = text.split(/[\n\r]+|(?<=[.!?])\s+/);
+  for (const sentence of sentences) {
+    const statusHintMatch = sentence.match(/^\s*(High|Low)\b/i);
+    const statusHint = statusHintMatch ? statusHintMatch[1].toLowerCase() : "";
+
+    for (const match of sentence.matchAll(rxNarrativeParen)) {
+      const [, statusRaw, nameRaw, val, unit] = match;
+      const status = statusRaw ? statusRaw[0].toUpperCase() + statusRaw.slice(1).toLowerCase() : undefined;
+      pushItem(nameRaw, val, unit, status);
+    }
+    for (const match of sentence.matchAll(rxNarrative)) {
+      const [, statusRaw, nameRaw, val, unit] = match;
+      const status = statusRaw ? statusRaw[0].toUpperCase() + statusRaw.slice(1).toLowerCase() : undefined;
+      pushItem(nameRaw, val, unit, status);
+    }
+
+    for (const match of sentence.matchAll(rxValueParen)) {
+      const [, nameRaw, val, unit] = match;
+      const status = statusHint ? statusHint[0].toUpperCase() + statusHint.slice(1).toLowerCase() : undefined;
+      pushItem(nameRaw, val, unit, status);
+    }
   }
   return out;
 }
@@ -69,11 +107,11 @@ function briefExplanation(aiText?: string): string {
 
 export default function LabSummaryCard({ response, aiText, devMode }: Props) {
   const uv = (response as any)?.user_view as ChatResponseCombined['user_view'] | undefined;
-  const usingUV = !!uv && (Array.isArray(uv.abnormal) || Array.isArray(uv.normal));
+  const usingUV = false;
 
-  const analytes = useMemo(() => parseAnalytesFromText(aiText), [aiText]);
-  const abFromText = analytes.filter(a => /high|low/i.test(a.status || ''));
-  const nlFromText = analytes.filter(a => !/high|low/i.test(a.status || ''));
+  const aiAnalytes = useMemo(() => parseAnalytesFromText(aiText), [aiText]);
+  const abFromText = aiAnalytes.filter(a => /high|low/i.test(a.status || ''));
+  const nlFromText = aiAnalytes.filter(a => !/high|low/i.test(a.status || ''));
 
   const isMedicalItem = (a: any): boolean => {
     const nm = ((a?.name ?? '') + '').trim().toLowerCase();
@@ -85,16 +123,29 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
     return true;
   };
 
-  const abnormal = (usingUV ? (uv?.abnormal || []) : abFromText).filter(isMedicalItem);
-  const normal = (usingUV ? (uv?.normal || []) : nlFromText).filter(isMedicalItem);
+  const useAiLists = aiAnalytes.length > 0;
+  const abnormal = (useAiLists ? abFromText : usingUV ? (uv?.abnormal || []) : abFromText).filter(isMedicalItem);
+  const normal = (useAiLists ? nlFromText : usingUV ? (uv?.normal || []) : nlFromText).filter(isMedicalItem);
 
-  const rec = usingUV ? (uv?.recommendation || pickRecommendation(response, aiText)) : pickRecommendation(response, aiText);
-  const conf = usingUV ? uv?.confidence : (response as any)?.confidence;
+  const statusBucket = (a: any): "high" | "low" | "other" => {
+    const raw = ((a?.status ?? "") + "").toLowerCase();
+    if (raw.includes("low")) return "low";
+    if (raw.includes("high") || raw.includes("elevated") || raw.includes("borderline")) return "high";
+    return "other";
+  };
+
+  const abnormalHigh = abnormal.filter((a) => statusBucket(a) === "high");
+  const abnormalLow = abnormal.filter((a) => statusBucket(a) === "low");
+  const abnormalOther = abnormal.filter((a) => statusBucket(a) === "other");
+
+  const rec = pickRecommendation(response, aiText);
+  const conf = (response as any)?.confidence;
   const saConf = response?.symptom_analysis?.confidence as number | undefined;
   const confidence = typeof conf === 'number' ? conf : (typeof saConf === 'number' ? saConf : undefined);
   const date = usingUV ? null : extractDate(aiText);
-  const brief = usingUV ? ((uv as any)?.explanation || briefExplanation(aiText)) : '';
-  const fullExplanation = usingUV ? (aiText || '') : '';
+  const brief = briefExplanation(aiText);
+  const fullExplanation = aiText || "";
+  const laymanText = brief;
 
   function formatItem(a: any): string {
     const nm = a?.name ?? '';
@@ -126,15 +177,15 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
       <div className="mb-2">
         <div className="text-base font-semibold">{usingUV ? (uv?.summary || 'Your lab summary') : `Your lab summary${date ? ` (${date})` : ''}`}</div>
       </div>
-      {abnormal.length > 0 && (
-        <div className="mb-1">
+      {abnormalHigh.length > 0 && (
+        <div className="mb-2">
           <div className="text-xs uppercase tracking-wide text-red-600 dark:text-red-400 mb-1 flex items-center gap-2">
-            <span>Abnormal</span>
-            <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200">{abnormal.length}</span>
+            <span>High</span>
+            <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200">{abnormalHigh.length}</span>
           </div>
           <ul className="pl-0 space-y-1">
-            {abnormal.map((a, i) => (
-              <li key={`ab-${i}`} className="flex items-start gap-2 text-red-700 dark:text-red-300 font-medium">
+            {abnormalHigh.map((a, i) => (
+              <li key={`ab-hi-${i}`} className="flex items-start gap-2 text-red-700 dark:text-red-300 font-medium">
                 <span className="mt-1 inline-block w-1.5 h-1.5 rounded-full bg-red-500 dark:bg-red-400"/>
                 <span>{formatItem(a)}</span>
               </li>
@@ -142,7 +193,39 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
           </ul>
         </div>
       )}
-      {abnormal.length > 0 && normal.length > 0 && (
+      {abnormalLow.length > 0 && (
+        <div className="mb-2">
+          <div className="text-xs uppercase tracking-wide text-amber-600 dark:text-amber-400 mb-1 flex items-center gap-2">
+            <span>Low</span>
+            <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200">{abnormalLow.length}</span>
+          </div>
+          <ul className="pl-0 space-y-1">
+            {abnormalLow.map((a, i) => (
+              <li key={`ab-lo-${i}`} className="flex items-start gap-2 text-amber-700 dark:text-amber-300 font-medium">
+                <span className="mt-1 inline-block w-1.5 h-1.5 rounded-full bg-amber-500 dark:bg-amber-400"/>
+                <span>{formatItem(a)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {abnormalOther.length > 0 && (
+        <div className="mb-2">
+          <div className="text-xs uppercase tracking-wide text-red-600 dark:text-red-400 mb-1 flex items-center gap-2">
+            <span>Out of range</span>
+            <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200">{abnormalOther.length}</span>
+          </div>
+          <ul className="pl-0 space-y-1">
+            {abnormalOther.map((a, i) => (
+              <li key={`ab-ot-${i}`} className="flex items-start gap-2 text-red-700 dark:text-red-300 font-medium">
+                <span className="mt-1 inline-block w-1.5 h-1.5 rounded-full bg-red-500 dark:bg-red-400"/>
+                <span>{formatItem(a)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {(abnormalHigh.length + abnormalLow.length + abnormalOther.length) > 0 && normal.length > 0 && (
         <div className="my-2 h-px bg-zinc-200 dark:bg-zinc-800" />
       )}
       {normal.length > 0 && (
@@ -153,15 +236,21 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
           </div>
           <ul className="pl-5 list-disc space-y-1">
             {normal.map((a, i) => (
-              <li key={`nl-${i}`}>{formatItem(a)}</li>
+              <li key={`nl-${i}`} className="text-emerald-700 dark:text-emerald-300">{formatItem(a)}</li>
             ))}
           </ul>
         </div>
       )}
-      {!abnormal.length && !normal.length && (
+      {(abnormalHigh.length + abnormalLow.length + abnormalOther.length) === 0 && normal.length === 0 && (
         <ul className="list-disc pl-5 space-y-1">
           <li className="italic text-zinc-500">No detected results</li>
         </ul>
+      )}
+      {laymanText && (
+        <div className="mt-3">
+          <div className="font-medium">In plain language</div>
+          <p className="text-sm text-zinc-700 dark:text-zinc-300 leading-snug">{laymanText}</p>
+        </div>
       )}
       <div className="mt-3">
         <div className="font-medium">Recommendations</div>
@@ -171,7 +260,7 @@ export default function LabSummaryCard({ response, aiText, devMode }: Props) {
         {typeof confidence === 'number' ? `Confidence: ${Math.round(confidence * 100)}%` : 'Confidence: -'}
       </div>
 
-      {usingUV && (fullExplanation || brief) && (
+      {(fullExplanation || brief) && (
         <div className="mt-3">
           <div className="font-medium">Explanation</div>
           <div className="prose prose-sm dark:prose-invert max-w-none text-sm text-zinc-700 dark:text-zinc-300 leading-snug">

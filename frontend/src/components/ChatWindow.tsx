@@ -200,7 +200,7 @@ export default function ChatWindow({
       {uploadStatus === "success" && (
         <div className="mx-4 mt-3 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-100 p-3 flex items-center gap-2 text-sm">
           <CheckCircle2 className="w-4 h-4" />
-          Lab uploaded. We pre-filled the composer with extracted text—edit and send when ready.
+          Lab uploaded. We sent it for analysis.
         </div>
       )}
       {analysisState === "loading" && (

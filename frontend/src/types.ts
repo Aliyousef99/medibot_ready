@@ -12,6 +12,7 @@ export type Message = {
   role: Role;
   content: string;
   ts: Date;
+  imageUrl?: string;
   requestId?: string;
   symptomAnalysis?: { symptoms?: string[]; possible_tests?: string[]; confidence?: number; event_id?: string | null };
   localRecommendations?: { priority: string; actions: string[]; follow_up: string; rationale: string };

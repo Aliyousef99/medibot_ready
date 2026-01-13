@@ -6,7 +6,7 @@ import ProfileModal from "./ProfileModal";
 import ConversationList from "./ConversationList";
 import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
-import { postChatMessage as apiChat, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent, getProfile as apiGetProfile } from "../services/api";
+import { postChatMessage as apiChat, postChatImage as apiChatImage, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent, getProfile as apiGetProfile } from "../services/api";
 import type { ChatResponseCombined, ConversationSummary, ConversationMessageRow } from "../services/api";
 import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
@@ -270,8 +270,12 @@ function ChatView() {
     }
   }
 
-  async function handleSend() {
-    const text = input.trim();
+  async function runChatRequest(
+    userText: string,
+    requestFn: (conversationId: string) => Promise<ChatResponseCombined>,
+    opts: { clearInput?: boolean; imageUrl?: string } = {}
+  ) {
+    const text = userText.trim();
     if (!text || !user) return;
     if (!user.profile?.consent_given && !consentWarnedRef.current) {
       addToast({ type: "info", message: "For best results, please consent to data processing (see banner above)." });
@@ -282,12 +286,20 @@ function ChatView() {
     actions.setBusy(true);
     setAnalysisState("loading");
     setAnalysisError(null);
-    const newUserMessage: Message = { id: `m_${Date.now()}`, role: "user", content: text, ts: new Date() };
+    const newUserMessage: Message = {
+      id: `m_${Date.now()}`,
+      role: "user",
+      content: text,
+      ts: new Date(),
+      imageUrl: opts.imageUrl,
+    };
     actions.applyToActive((msgs) => [...msgs, newUserMessage]);
-    actions.setInput("");
+    if (opts.clearInput !== false) {
+      actions.setInput("");
+    }
 
     try {
-      const chatResponse: ChatResponseCombined = await apiChat(text, conversationId);
+      const chatResponse: ChatResponseCombined = await requestFn(conversationId);
       const targetConversationId = chatResponse.conversation_id || conversationId || activeId || "";
       const replaced =
         Boolean(targetConversationId) && Boolean(activeId) && targetConversationId !== activeId;
@@ -368,6 +380,11 @@ function ChatView() {
     }
   }
 
+  async function handleSend() {
+    const text = input.trim();
+    await runChatRequest(text, (conversationId) => apiChat(text, conversationId));
+  }
+
   async function onFilePicked(file: File) {
     const allowedTypes = new Set(["application/pdf", "image/jpeg", "image/png"]);
     const ext = (file.name || "").toLowerCase().split(".").pop() || "";
@@ -382,10 +399,20 @@ function ChatView() {
     setUploadStatus("loading");
     setUploadError(null);
     try {
-      const lab = await uploadLabAndSave(file);
-      actions.setInput(lab.raw_text || "");
-      addToast({ type: "info", message: "Lab uploaded and saved to history." });
-      rerunLastMessage("lab_upload");
+      const isPdf = file.type === "application/pdf" || ext === "pdf";
+      if (isPdf) {
+        const lab = await uploadLabAndSave(file);
+        const rawText = lab.raw_text || "";
+        if (!rawText.trim()) {
+          throw new Error("No text could be extracted from this PDF.");
+        }
+        addToast({ type: "info", message: "PDF uploaded. Sending for analysis..." });
+        await runChatRequest(rawText, (conversationId) => apiChat(rawText, conversationId), { clearInput: false });
+      } else {
+        addToast({ type: "info", message: "Image uploaded. Analyzing..." });
+        const imageUrl = URL.createObjectURL(file);
+        await runChatRequest("Uploaded lab image.", (conversationId) => apiChatImage(file, conversationId), { clearInput: false, imageUrl });
+      }
       setUploadStatus("success");
       setTimeout(() => setUploadStatus("idle"), 1200);
     } catch (e: any) {
