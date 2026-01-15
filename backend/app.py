@@ -39,11 +39,14 @@ from backend.models.user import User, UserProfile
 from backend.models.lab_report import LabReport
 from backend.models.symptom_event import SymptomEvent
 from backend.models.conversation import Conversation
+from backend.models.conversation_context import ConversationContext
 from backend.models.message import Message, MessageRole
 from backend.routes import auth_routes, history_routes, symptoms_routes, recs_routes, chat_routes, privacy_routes
 from backend.services.symptom_analysis import analyze_text as analyze_symptom_text
 from backend.services.symptom_events import save_symptom_event
 from backend.services.recommendations import recommend, red_flag_triage, lab_triage
+from backend.services.reference_ranges import apply_universal_reference_ranges
+from backend.services.ocr import extract_text_from_bytes
 from backend.routers.profile import router as profile_router
 from backend.utils.app import build_chat_context
 
@@ -376,6 +379,14 @@ class ConversationOut(BaseModel):
     title: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+class ConversationContextOut(BaseModel):
+    conversation_id: str
+    system_prompt: Optional[str] = None
+    lab_tests: Optional[List[Dict[str, Any]]] = None
+
+class ConversationContextIn(BaseModel):
+    system_prompt: Optional[str] = None
 
 class MessageOut(BaseModel):
     id: str
@@ -1129,6 +1140,115 @@ def _ensure_conversation(db: Session, user: User, conv_id: Optional[str], first_
     db.refresh(conv)
     return conv
 
+def _get_conversation_context(db: Session, user_id: str, conversation_id: Optional[str]) -> Optional[ConversationContext]:
+    if not conversation_id:
+        return None
+    try:
+        return (
+            db.query(ConversationContext)
+            .filter(
+                ConversationContext.conversation_id == conversation_id,
+                ConversationContext.user_id == user_id,
+            )
+            .first()
+        )
+    except Exception:
+        return None
+
+def _format_lab_tests_for_prompt(tests: List[Dict[str, Any]]) -> str:
+    if not tests:
+        return "None"
+    lines = []
+    for t in tests[:12]:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or "Test"
+        val = t.get("value")
+        unit = t.get("unit") or ""
+        try:
+            num = float(str(val).replace(",", ""))
+            if abs(num - round(num)) < 1e-6:
+                val_txt = str(int(round(num)))
+            else:
+                val_txt = f"{num:.2f}".rstrip("0").rstrip(".")
+        except Exception:
+            val_txt = str(val)
+        ref_min = t.get("ref_min")
+        ref_max = t.get("ref_max")
+        ref_txt = ""
+        if ref_min is not None or ref_max is not None:
+            if ref_min is not None and ref_max is not None:
+                ref_txt = f"ref {ref_min}-{ref_max}{(' ' + unit) if unit else ''}"
+            elif ref_min is not None:
+                ref_txt = f"ref >= {ref_min}{(' ' + unit) if unit else ''}"
+            else:
+                ref_txt = f"ref <= {ref_max}{(' ' + unit) if unit else ''}"
+        status = (t.get("status") or t.get("abnormal") or "").lower()
+        parts = [f"{name}: {val_txt}{(' ' + unit) if unit else ''}"]
+        if ref_txt:
+            parts.append(ref_txt)
+        if status:
+            parts.append(f"flagged {status}")
+        lines.append("- " + "; ".join(parts))
+    return "\n".join(lines) if lines else "None"
+
+def _merge_lab_table_into_prompt(existing: str, tests: List[Dict[str, Any]]) -> str:
+    table = _format_lab_tests_for_prompt(tests)
+    if table == "None":
+        return existing or ""
+    start = "[[LAB_TABLE]]"
+    end = "[[/LAB_TABLE]]"
+    block = f"{start}\nConversation Lab Table (authoritative):\n{table}\n{end}"
+    if not existing:
+        return block
+    if start in existing and end in existing:
+        pre = existing.split(start)[0].rstrip()
+        post = existing.split(end)[-1].lstrip()
+        return "\n\n".join([p for p in [pre, block, post] if p])
+    return "\n\n".join([existing.strip(), block])
+
+async def _extract_tests_from_gemini(text: str) -> List[Dict[str, Any]]:
+    if not GEMINI_API_KEY or not text.strip():
+        return []
+    prompt = (
+        "Extract lab tests from the text below. Return ONLY a JSON array. "
+        "Each item: {\"name\": str, \"value\": number or string, \"unit\": str, "
+        "\"ref_min\": number or null, \"ref_max\": number or null, "
+        "\"status\": \"low\"|\"high\"|\"normal\"|\"unspecified\"}. "
+        "If a range is shown like 13.0-17.0, set ref_min/ref_max. "
+        "If no range, use nulls. Do not add extra keys.\n\n"
+        f"{text.strip()}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+            r = await client.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"role": "user", "parts": [{"text": prompt.strip()}]}]},
+            )
+            r.raise_for_status()
+            data = r.json()
+            text_out = (
+                data.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                or ""
+            ).strip()
+            if "```" in text_out:
+                text_out = re.sub(r"^```(?:json)?", "", text_out.strip(), flags=re.IGNORECASE).strip()
+                text_out = re.sub(r"```$", "", text_out.strip()).strip()
+            parsed = json.loads(text_out)
+            if isinstance(parsed, dict) and isinstance(parsed.get("tests"), list):
+                return parsed.get("tests")  # type: ignore[return-value]
+            if isinstance(parsed, list):
+                return parsed  # type: ignore[return-value]
+            return []
+    except Exception:
+        return []
+
 def _persist_message(db: Session, conv: Conversation, user: User, role: MessageRole, content: str) -> Message:
     try:
         conv.updated_at = datetime.utcnow()
@@ -1237,6 +1357,14 @@ async def chat(
 
     # Ensure a conversation exists and persist incoming user message
     conv = _ensure_conversation(db, user, getattr(payload, "conversation_id", None), payload.message or "")
+    conv_ctx = _get_conversation_context(db, str(user.id), conv.id)
+    conv_system_prompt = (conv_ctx.system_prompt or "").strip() if conv_ctx else ""
+    conv_lab_tests = None
+    if conv_ctx and conv_ctx.lab_tests_json:
+        try:
+            conv_lab_tests = json.loads(conv_ctx.lab_tests_json)
+        except Exception:
+            conv_lab_tests = None
     try:
         append_chat_history(str(user.id), "user", payload.message or "")
     except Exception:
@@ -1737,6 +1865,17 @@ async def chat(
     except Exception:
         latest_lab_struct_early = None
         lab_source = "none"
+    try:
+        if isinstance(latest_lab_struct_early, dict):
+            tests = latest_lab_struct_early.get("tests")
+            if isinstance(tests, list):
+                apply_universal_reference_ranges(tests)
+            labs_obj = latest_lab_struct_early.get("labs") if isinstance(latest_lab_struct_early.get("labs"), dict) else None
+            analytes = labs_obj.get("analytes") if isinstance(labs_obj, dict) else None
+            if isinstance(analytes, list):
+                apply_universal_reference_ranges(analytes)
+    except Exception:
+        pass
     # Single lab_context success log per request when found via current/cache (DB branch logs on success)
     try:
         if not _lab_context_logged and isinstance(latest_lab_struct_early, dict) and lab_source in ("current", "cache"):
@@ -1976,6 +2115,13 @@ async def chat(
         history_block = ""
 
     context, notice = build_chat_context(db, user, payload.message, structured_override=latest_lab_struct_early)
+    conv_lab_block = _format_lab_tests_for_prompt(conv_lab_tests or [])
+    conv_lab_prompt = ""
+    if conv_lab_tests:
+        conv_lab_prompt = f"--- Conversation Lab Table (authoritative) ---\n{conv_lab_block}\n\n"
+    conv_system_prompt_block = ""
+    if conv_system_prompt:
+        conv_system_prompt_block = f"--- Conversation System Prompt (user-edited) ---\n{conv_system_prompt}\n\n"
     prompt = (
         "You are a helpful medical assistant. Use the provided context to answer the user's question. "
         "Personalize guidance using the patient's age, sex, pre-existing conditions, and medications from the profile. "
@@ -1983,7 +2129,13 @@ async def chat(
         "The context includes the user's profile, their latest lab report, and their latest symptom summary. "
         "Provide general, educational information and you may answer follow-up questions about likely causes of abnormal tests (e.g., high ferritin) and typical next steps. "
         "Avoid diagnosis or prescriptions; include caveats and when to seek care. "
-        "Keep responses concise and easy to understand.\n\n"
+        "Keep responses concise and easy to understand. "
+        "If Lab Report Availability says Available: yes, do not say you lack the lab report; use the lab content provided (structured or raw text). "
+        "Use the Key Tests block for follow-up questions; quote the exact values, units, and reference ranges as written there. "
+        "Do not round or drop decimals; if the value shows a decimal, keep it. "
+        "If any test includes reference_source 'universal' or reference_note, clearly state that the range is a general reference and not from the user's lab report.\n\n"
+        f"{conv_system_prompt_block}"
+        f"{conv_lab_prompt}"
         f"TRIAGE: {(triage or {}).get('level', 'low')} | Reasons: {', '.join((triage or {}).get('reasons', []) or [])}\n"
         "\n--- Conversation History (most recent first) ---\n"
         f"{history_block}\n\n"
@@ -2056,6 +2208,8 @@ async def chat(
     if not ai_explanation:
         ai_explanation = "AI explanation unavailable; showing structured recommendations."
         ai_explanation_source = "fallback"
+
+    # Rely on conversation lab table + history for consistency (no auto-injected lab facts).
 
     # Compute missing context fields for guided completion banner
     missing_fields: List[str] = []
@@ -2185,13 +2339,74 @@ async def chat_image(
     except Exception:
         logger.warning("db_persist_user_message_failed", exc_info=True)
 
+    raw_text = ""
+    lab_tests: List[Dict[str, Any]] = []
+    try:
+        raw_text, source = extract_text_from_bytes(data, file.filename or "upload", file.content_type or "")
+        lab_tests = await _extract_tests_from_gemini(raw_text)
+    except Exception:
+        raw_text = ""
+        lab_tests = []
+    if lab_tests:
+        try:
+            apply_universal_reference_ranges(lab_tests)
+        except Exception:
+            pass
+        try:
+            ctx = _get_conversation_context(db, str(user.id), conv.id)
+            if not ctx:
+                ctx = ConversationContext(
+                    user_id=str(user.id),
+                    conversation_id=conv.id,
+                    lab_tests_json=json.dumps(lab_tests, ensure_ascii=False),
+                )
+                db.add(ctx)
+            else:
+                ctx.lab_tests_json = json.dumps(lab_tests, ensure_ascii=False)
+            ctx.system_prompt = _merge_lab_table_into_prompt(ctx.system_prompt or "", lab_tests)
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        try:
+            structured = {"tests": lab_tests, "meta": {"engine": "gemini"}}
+            summary = f"Parsed {len(lab_tests)} analytes via Gemini."
+            lr = LabReport(
+                user_id=str(user.id),
+                title=file.filename or "Lab Report",
+                raw_text=raw_text,
+                structured_json=structured,
+                summary=summary,
+            )
+            db.add(lr)
+            db.commit()
+            try:
+                conv.active_lab_id = str(lr.id)
+                db.add(conv)
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            set_latest_lab_cache(str(user.id), structured)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
     context, _notice = build_chat_context(db, user, user_text)
+    lab_table = _format_lab_tests_for_prompt(lab_tests) if lab_tests else "None"
+    lab_table_block = f"\n\n--- Extracted Lab Table (from image OCR) ---\n{lab_table}\n" if lab_tests else ""
     prompt = (
         "You are a helpful medical assistant. Analyze the attached lab report image. "
         "Extract all tests with value, unit, reference range (if visible), and flag high/low/normal when possible. "
         "Then provide a concise summary and a plain-language explanation. "
         "Avoid diagnosis or prescriptions; include caveats and when to seek care.\n\n"
-        f"{context}\n"
+        f"{context}{lab_table_block}\n"
     )
 
     ai_explanation = ""
@@ -2312,27 +2527,52 @@ async def chat_image(
 @limiter.limit("2/minute")
 async def explain(request: Request, payload: ExplainIn, db: Session = Depends(get_db), user: User = Depends(get_current_user), response: Response = None) -> ExplainOut:
     structured = payload.structured
+    try:
+        if isinstance(structured, dict):
+            tests = structured.get("tests")
+            if isinstance(tests, list):
+                apply_universal_reference_ranges(tests)
+    except Exception:
+        pass
     def _format_range(test: Dict[str, Any]) -> str:
         if test.get("ref_min") is not None or test.get("ref_max") is not None:
             ref_min = test.get("ref_min")
             ref_max = test.get("ref_max")
             if ref_min is not None and ref_max is not None:
-                return f"{ref_min}-{ref_max}"
+                base = f"{ref_min}-{ref_max}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
             if ref_min is not None:
-                return f">= {ref_min}"
+                base = f">= {ref_min}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
             if ref_max is not None:
-                return f"<= {ref_max}"
+                base = f"<= {ref_max}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
         ref = test.get("reference")
         if isinstance(ref, dict):
             kind = ref.get("kind")
             if kind == "between":
-                return f"{ref.get('lo')}-{ref.get('hi')}"
+                base = f"{ref.get('lo')}-{ref.get('hi')}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
             if kind in ("lt", "lte"):
                 op = "<=" if kind == "lte" else "<"
-                return f"{op} {ref.get('v')}"
+                base = f"{op} {ref.get('v')}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
             if kind in ("gt", "gte"):
                 op = ">=" if kind == "gte" else ">"
-                return f"{op} {ref.get('v')}"
+                base = f"{op} {ref.get('v')}"
+                if test.get("reference_source") == "universal" or test.get("reference_note"):
+                    return f"{base} (general reference; not from this lab report)"
+                return base
         return "N/A"
 
     # fallback if no key
@@ -2389,7 +2629,8 @@ async def explain(request: Request, payload: ExplainIn, db: Session = Depends(ge
     # call Gemini
     prompt = (
         "You are a clinician assistant. Given structured lab data, produce a concise, "
-        "patient-friendly explanation (<=200 words). Not medical advice.\n\n" +
+        "patient-friendly explanation (<=200 words). Not medical advice. "
+        "If any test includes reference_source 'universal' or reference_note, say the range is general and not from the lab report.\n\n" +
         f"{json.dumps(structured, ensure_ascii=False)}"
     )
     try:
@@ -2473,6 +2714,70 @@ def list_conversations(db: Session = Depends(get_db), user: User = Depends(get_c
         .all()
     )
     return items
+
+@router.get("/chat/conversations/{conversation_id}/context", response_model=ConversationContextOut)
+def get_conversation_context(conversation_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.user_id == str(user.id))
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    ctx = (
+        db.query(ConversationContext)
+        .filter(
+            ConversationContext.conversation_id == conversation_id,
+            ConversationContext.user_id == str(user.id),
+        )
+        .first()
+    )
+    lab_tests = None
+    if ctx and ctx.lab_tests_json:
+        try:
+            lab_tests = json.loads(ctx.lab_tests_json)
+        except Exception:
+            lab_tests = None
+    return ConversationContextOut(
+        conversation_id=conversation_id,
+        system_prompt=ctx.system_prompt if ctx else None,
+        lab_tests=lab_tests,
+    )
+
+@router.put("/chat/conversations/{conversation_id}/context", response_model=ConversationContextOut)
+def update_conversation_context(conversation_id: str, payload: ConversationContextIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.user_id == str(user.id))
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    ctx = (
+        db.query(ConversationContext)
+        .filter(
+            ConversationContext.conversation_id == conversation_id,
+            ConversationContext.user_id == str(user.id),
+        )
+        .first()
+    )
+    if not ctx:
+        ctx = ConversationContext(user_id=str(user.id), conversation_id=conversation_id, system_prompt=payload.system_prompt)
+        db.add(ctx)
+    else:
+        ctx.system_prompt = payload.system_prompt
+    db.commit()
+    lab_tests = None
+    if ctx.lab_tests_json:
+        try:
+            lab_tests = json.loads(ctx.lab_tests_json)
+        except Exception:
+            lab_tests = None
+    return ConversationContextOut(
+        conversation_id=conversation_id,
+        system_prompt=ctx.system_prompt,
+        lab_tests=lab_tests,
+    )
 
 @router.post("/chat/conversations", response_model=ConversationOut)
 def create_conversation(payload: ConversationCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):

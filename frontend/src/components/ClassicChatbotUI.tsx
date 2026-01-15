@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { Moon, Sun, Menu } from "lucide-react";
 import AuthScreen from "./AuthScreen";
@@ -6,7 +6,7 @@ import ProfileModal from "./ProfileModal";
 import ConversationList from "./ConversationList";
 import ChatWindow from "./ChatWindow";
 import AnalysisPanel from "./AnalysisPanel";
-import { postChatMessage as apiChat, postChatImage as apiChatImage, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent, getProfile as apiGetProfile } from "../services/api";
+import { postChatMessage as apiChat, postChatImage as apiChatImage, uploadLabAndSave, listConversations, createConversation, deleteConversationApi, getConversationMessages, setConsent, getProfile as apiGetProfile, getConversationContext, updateConversationContext } from "../services/api";
 import type { ChatResponseCombined, ConversationSummary, ConversationMessageRow } from "../services/api";
 import { chatScopeForUser, useChatStore } from "../state/chatStore";
 import { useAuth } from "../hooks/useAuth";
@@ -49,6 +49,10 @@ function ChatView() {
   const [analysisState, setAnalysisState] = useState<"idle" | "loading" | "error">("idle");
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [consentBusy, setConsentBusy] = useState(false);
+  const [imageAttachments, setImageAttachments] = useState<{ id: string; file: File; previewUrl: string }[]>([]);
+  const [pdfAttachment, setPdfAttachment] = useState<{ id: string; file: File } | null>(null);
+  const [systemPromptById, setSystemPromptById] = useState<Record<string, string>>({});
+  const [systemPromptDraft, setSystemPromptDraft] = useState<string>("");
   const consentWarnedRef = useRef(false);
   const conversations = useChatStore((s) => s.conversations);
   const activeId = useChatStore((s) => s.activeId);
@@ -89,6 +93,45 @@ function ChatView() {
   }, [explanation]);
 
   const uploadInputRef = useRef<HTMLInputElement>(null);
+  const previewUrlsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    return () => {
+      previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      previewUrlsRef.current.clear();
+    };
+  }, []);
+
+  const refreshConversationContext = useCallback(async (conversationId: string | null) => {
+    if (!conversationId) return;
+    try {
+      const ctx = await getConversationContext(conversationId);
+      const prompt = ctx.system_prompt || "";
+      setSystemPromptById((prev) => ({ ...prev, [conversationId]: prompt }));
+      setSystemPromptDraft(prompt);
+    } catch {
+      setSystemPromptDraft("");
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!activeId) return;
+      try {
+        const ctx = await getConversationContext(activeId);
+        if (cancelled) return;
+        const prompt = ctx.system_prompt || "";
+        setSystemPromptById((prev) => ({ ...prev, [activeId]: prompt }));
+        setSystemPromptDraft(prompt);
+      } catch {
+        if (!cancelled) setSystemPromptDraft("");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -277,10 +320,10 @@ function ChatView() {
   async function runChatRequest(
     userText: string,
     requestFn: (conversationId: string) => Promise<ChatResponseCombined>,
-    opts: { clearInput?: boolean; imageUrl?: string } = {}
+    opts: { clearInput?: boolean; imageUrl?: string; displayText?: string; allowEmpty?: boolean } = {}
   ) {
     const text = userText.trim();
-    if (!text || !user) return;
+    if ((!text && !opts.allowEmpty) || !user) return;
     if (!user.profile?.consent_given && !consentWarnedRef.current) {
       addToast({ type: "info", message: "For best results, please consent to data processing (see banner above)." });
       consentWarnedRef.current = true;
@@ -293,7 +336,7 @@ function ChatView() {
     const newUserMessage: Message = {
       id: `m_${Date.now()}`,
       role: "user",
-      content: text,
+      content: opts.displayText ?? text,
       ts: new Date(),
       imageUrl: opts.imageUrl,
     };
@@ -397,46 +440,113 @@ function ChatView() {
 
   async function handleSend() {
     const text = input.trim();
+    if (pdfAttachment) {
+      actions.setFileBusy(true);
+      setUploadStatus("loading");
+      setUploadError(null);
+      try {
+        const lab = await uploadLabAndSave(pdfAttachment.file);
+        const rawText = (lab as any)?.raw_text || "";
+        const sendText = text
+          ? `${text}\n\n---\nLab report text:\n${rawText}`
+          : rawText;
+        const displayText = text || `Lab report: ${pdfAttachment.file.name}`;
+        if (!sendText.trim()) {
+          throw new Error("No text could be extracted from this PDF.");
+        }
+        await runChatRequest(sendText, (conversationId) => apiChat(sendText, conversationId), {
+          displayText,
+          clearInput: true,
+        });
+        setPdfAttachment(null);
+        setUploadStatus("success");
+        setTimeout(() => setUploadStatus("idle"), 1200);
+        await refreshConversationContext(activeId);
+      } catch (e: any) {
+        addToast({ type: "error", message: e?.message || "File upload or parsing failed. Please try again." });
+        setUploadStatus("error");
+        setUploadError(e?.message || "Upload failed");
+      } finally {
+        actions.setFileBusy(false);
+      }
+      return;
+    }
+    if (imageAttachments.length > 0) {
+      actions.setFileBusy(true);
+      setUploadStatus("loading");
+      setUploadError(null);
+      try {
+        for (let i = 0; i < imageAttachments.length; i += 1) {
+          const att = imageAttachments[i];
+          const displayText = i === 0 ? text : "";
+          await runChatRequest(
+            displayText,
+            (conversationId) => apiChatImage(att.file, conversationId),
+            { displayText, clearInput: i === 0, imageUrl: att.previewUrl, allowEmpty: true }
+          );
+        }
+        imageAttachments.forEach((att) => URL.revokeObjectURL(att.previewUrl));
+        imageAttachments.forEach((att) => previewUrlsRef.current.delete(att.previewUrl));
+        setImageAttachments([]);
+        setUploadStatus("success");
+        setTimeout(() => setUploadStatus("idle"), 1200);
+        await refreshConversationContext(activeId);
+      } catch (e: any) {
+        addToast({ type: "error", message: e?.message || "File upload or parsing failed. Please try again." });
+        setUploadStatus("error");
+        setUploadError(e?.message || "Upload failed");
+      } finally {
+        actions.setFileBusy(false);
+      }
+      return;
+    }
     await runChatRequest(text, (conversationId) => apiChat(text, conversationId));
   }
 
-  async function onFilePicked(file: File) {
-    const allowedTypes = new Set(["application/pdf", "image/jpeg", "image/png"]);
-    const ext = (file.name || "").toLowerCase().split(".").pop() || "";
-    const allowedExts = new Set(["pdf", "jpg", "jpeg", "png"]);
-    const hasAllowedType = allowedTypes.has(file.type);
-    const hasAllowedExt = allowedExts.has(ext);
-    if (!hasAllowedType && !hasAllowedExt) {
+  async function onFilePicked(files: FileList) {
+    const list = Array.from(files || []);
+    if (list.length === 0) return;
+    const pdf = list.find((f) => f.type === "application/pdf" || (f.name || "").toLowerCase().endsWith(".pdf"));
+    if (pdf) {
+      if (imageAttachments.length > 0) {
+        imageAttachments.forEach((att) => URL.revokeObjectURL(att.previewUrl));
+        imageAttachments.forEach((att) => previewUrlsRef.current.delete(att.previewUrl));
+        setImageAttachments([]);
+      }
+      setPdfAttachment({ id: `pdf_${Date.now()}`, file: pdf });
+      if (list.length > 1) {
+        addToast({ type: "info", message: "Selected PDF. Additional images were ignored." });
+      }
+      return;
+    }
+    const imageFiles = list.filter((f) => {
+      const ext = (f.name || "").toLowerCase().split(".").pop() || "";
+      const allowedTypes = new Set(["image/jpeg", "image/png"]);
+      const allowedExts = new Set(["jpg", "jpeg", "png"]);
+      return allowedTypes.has(f.type) || allowedExts.has(ext);
+    });
+    if (imageFiles.length === 0) {
       addToast({ type: "error", message: "Unsupported file type. Please upload a PDF or JPG/PNG image." });
       return;
     }
-    actions.setFileBusy(true);
-    setUploadStatus("loading");
-    setUploadError(null);
-    try {
-      const isPdf = file.type === "application/pdf" || ext === "pdf";
-      if (isPdf) {
-        const lab = await uploadLabAndSave(file);
-        const rawText = lab.raw_text || "";
-        if (!rawText.trim()) {
-          throw new Error("No text could be extracted from this PDF.");
-        }
-        addToast({ type: "info", message: "PDF uploaded. Sending for analysis..." });
-        await runChatRequest(rawText, (conversationId) => apiChat(rawText, conversationId), { clearInput: false });
-      } else {
-        addToast({ type: "info", message: "Image uploaded. Analyzing..." });
-        const imageUrl = URL.createObjectURL(file);
-        await runChatRequest("Uploaded lab image.", (conversationId) => apiChatImage(file, conversationId), { clearInput: false, imageUrl });
-      }
-      setUploadStatus("success");
-      setTimeout(() => setUploadStatus("idle"), 1200);
-    } catch (e: any) {
-      addToast({ type: "error", message: e?.message || "File upload or parsing failed. Please try again." });
-      setUploadStatus("error");
-      setUploadError(e?.message || "Upload failed");
-    } finally {
-      actions.setFileBusy(false);
+    if (pdfAttachment) {
+      setPdfAttachment(null);
     }
+    const remaining = Math.max(0, 3 - imageAttachments.length);
+    if (remaining <= 0) {
+      addToast({ type: "info", message: "You can attach up to 3 images." });
+      return;
+    }
+    const nextFiles = imageFiles.slice(0, remaining);
+    const nextAttachments = nextFiles.map((file, idx) => {
+      const previewUrl = URL.createObjectURL(file);
+      previewUrlsRef.current.add(previewUrl);
+      return { id: `img_${Date.now()}_${idx}`, file, previewUrl };
+    });
+    if (imageFiles.length > remaining) {
+      addToast({ type: "info", message: "Only 3 images can be attached at once." });
+    }
+    setImageAttachments((prev) => [...prev, ...nextAttachments]);
   }
 
   function rerunLastMessage(reason?: string) {
@@ -565,6 +675,22 @@ function ChatView() {
           uploadInputRef={uploadInputRef}
           onUploadClick={() => uploadInputRef.current?.click()}
           onFilePicked={onFilePicked}
+          attachments={[
+            ...imageAttachments.map((att) => ({ id: att.id, name: att.file.name, kind: "image" as const, previewUrl: att.previewUrl })),
+            ...(pdfAttachment ? [{ id: pdfAttachment.id, name: pdfAttachment.file.name, kind: "pdf" as const }] : []),
+          ]}
+          onRemoveAttachment={(id) => {
+            const img = imageAttachments.find((att) => att.id === id);
+            if (img) {
+              URL.revokeObjectURL(img.previewUrl);
+              previewUrlsRef.current.delete(img.previewUrl);
+              setImageAttachments((prev) => prev.filter((att) => att.id !== id));
+              return;
+            }
+            if (pdfAttachment && pdfAttachment.id === id) {
+              setPdfAttachment(null);
+            }
+          }}
           uploadStatus={uploadStatus}
           uploadError={uploadError}
           onClearUploadError={() => setUploadError(null)}
@@ -609,6 +735,20 @@ function ChatView() {
           recommendations={recommendations as any}
           analysisState={analysisState}
           analysisError={analysisError}
+          systemPrompt={activeId ? systemPromptById[activeId] : ""}
+          systemPromptDraft={systemPromptDraft}
+          onSystemPromptChange={setSystemPromptDraft}
+          onSaveSystemPrompt={async () => {
+            if (!activeId) return;
+            try {
+              const ctx = await updateConversationContext(activeId, systemPromptDraft);
+              setSystemPromptById((prev) => ({ ...prev, [activeId]: ctx.system_prompt || "" }));
+              setSystemPromptDraft(ctx.system_prompt || "");
+              addToast({ type: "info", message: "System prompt updated." });
+            } catch (e: any) {
+              addToast({ type: "error", message: e?.message || "Failed to update system prompt." });
+            }
+          }}
         />
       )}
       </div>

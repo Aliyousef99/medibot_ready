@@ -44,7 +44,9 @@ type ComposerProps = {
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   onSend: () => void;
   uploadInputRef: RefObject<HTMLInputElement>;
-  onFilePicked: (file: File) => void;
+  onFilePicked: (files: FileList) => void;
+  attachments?: { id: string; name: string; kind: "image" | "pdf"; previewUrl?: string }[];
+  onRemoveAttachment?: (id: string) => void;
   busy: boolean;
   fileBusy: boolean;
 };
@@ -56,6 +58,8 @@ export default function Composer({
   onSend,
   uploadInputRef,
   onFilePicked,
+  attachments = [],
+  onRemoveAttachment,
   busy,
   fileBusy,
 }: ComposerProps) {
@@ -178,6 +182,38 @@ export default function Composer({
     <div className="px-4 lg:px-6 py-3 bg-gradient-to-t from-zinc-50 via-zinc-50/90 to-transparent dark:from-zinc-900 dark:via-zinc-900/90">
       <div className="mx-auto max-w-3xl">
         <div className="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 shadow-sm p-2">
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-zinc-900/60 px-3 py-2">
+              {attachments.map((attachment) => (
+                <div key={attachment.id} className="flex items-center gap-2">
+                  {attachment.kind === "image" && attachment.previewUrl ? (
+                    <img
+                      src={attachment.previewUrl}
+                      alt={attachment.name}
+                      className="h-10 w-10 rounded-lg object-cover border border-zinc-200 dark:border-zinc-800"
+                    />
+                  ) : (
+                    <div className="h-10 w-10 rounded-lg bg-zinc-200 dark:bg-zinc-800 flex items-center justify-center text-[10px] font-semibold text-zinc-600 dark:text-zinc-300">
+                      PDF
+                    </div>
+                  )}
+                  <div className="max-w-[140px] text-xs text-zinc-700 dark:text-zinc-200 truncate">
+                    {attachment.name}
+                  </div>
+                  {onRemoveAttachment && (
+                    <button
+                      type="button"
+                      onClick={() => onRemoveAttachment(attachment.id)}
+                      className="text-[11px] px-2 py-1 rounded-lg border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                      aria-label={`Remove ${attachment.name}`}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <label
               className={`shrink-0 inline-flex items-center justify-center rounded-xl p-2 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${
@@ -190,8 +226,9 @@ export default function Composer({
                 type="file"
                 className="hidden"
                 accept=".pdf,.jpg,.jpeg,.png"
+                multiple
                 ref={uploadInputRef}
-                onChange={(e) => e.target.files && onFilePicked(e.target.files[0])}
+                onChange={(e) => e.target.files && onFilePicked(e.target.files)}
                 disabled={fileBusy}
               />
               {fileBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />}
@@ -205,7 +242,6 @@ export default function Composer({
               rows={1}
               placeholder={fileBusy ? "Extracting text from file..." : "Paste lab text or type your question..."}
               className="flex-1 min-h-[3rem] resize-none bg-transparent px-2 py-2 outline-none placeholder:text-zinc-400 text-sm"
-              disabled={fileBusy}
             />
 
             <button
@@ -227,7 +263,7 @@ export default function Composer({
             <button
               onClick={onSend}
               className="shrink-0 inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 hover:opacity-90 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-zinc-400"
-              disabled={!input.trim() || busy || fileBusy}
+              disabled={(!input.trim() && attachments.length === 0) || busy || fileBusy}
               aria-label="Send"
             >
               {busy ? (

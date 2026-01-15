@@ -10,6 +10,7 @@ from . import symptom_event  # noqa: F401
 from . import recommendation  # noqa: F401
 from . import message  # noqa: F401
 from . import conversation  # noqa: F401
+from . import conversation_context  # noqa: F401
 
 
 def init_db() -> None:

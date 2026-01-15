@@ -44,9 +44,10 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
         pass
     profile = db.query(UserProfile).filter(cast(UserProfile.user_id, SAText) == str(user.id)).first()
     profile_str = _profile_lines(profile) 
-    # Latest lab report (structured) — allow override from request context
+    # Latest lab report (structured) - allow override from request context
     if structured_override is not None:
         lab_struct = structured_override
+        lab_source = "structured_override"
     else:
         lab = (
             db.query(LabReport)
@@ -55,7 +56,54 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
             .first() 
         )
         lab_struct = lab.structured_json if (lab and lab.structured_json) else None
-    lab_str = json.dumps(lab_struct, ensure_ascii=False, indent=2) if lab_struct else "None provided"
+        lab_source = "structured" if lab_struct else "none"
+    def _fmt_val(v: Any) -> str:
+        if v is None:
+            return "?"
+        try:
+            num = float(str(v).replace(",", ""))
+        except Exception:
+            return str(v)
+        if abs(num - round(num)) < 1e-6:
+            return str(int(round(num)))
+        return f"{num:.2f}".rstrip("0").rstrip(".")
+
+    key_tests = []
+    if lab_struct:
+        try:
+            tests = lab_struct.get("tests") if isinstance(lab_struct, dict) else None
+            if isinstance(tests, list):
+                for t in tests[:12]:
+                    if not isinstance(t, dict):
+                        continue
+                    name = t.get("name") or "Test"
+                    val = _fmt_val(t.get("value"))
+                    unit = t.get("unit") or ""
+                    ref_min = t.get("ref_min")
+                    ref_max = t.get("ref_max")
+                    parts = [f"{name}: {val}{(' ' + unit) if unit else ''}"]
+                    if ref_min is not None or ref_max is not None:
+                        if ref_min is not None and ref_max is not None:
+                            parts.append(f"ref {ref_min}-{ref_max}")
+                        elif ref_min is not None:
+                            parts.append(f"ref >= {ref_min}")
+                        else:
+                            parts.append(f"ref <= {ref_max}")
+                    if t.get("reference_source") == "universal" or t.get("reference_note"):
+                        parts.append("ref source: general (not lab)")
+                    key_tests.append("; ".join(str(p) for p in parts if p))
+        except Exception:
+            key_tests = []
+        lab_str = json.dumps(lab_struct, ensure_ascii=False, indent=2)
+    else:
+        lab_str = "None provided"
+        if structured_override is None:
+            if lab and getattr(lab, "raw_text", None):
+                lab_str = f"Raw lab text:\n{str(lab.raw_text)}"
+                lab_source = "raw_text"
+            elif lab and getattr(lab, "summary", None):
+                lab_str = f"Lab summary text:\n{str(lab.summary)}"
+                lab_source = "summary"
 
     # Latest symptom event (optional)
     sym = (
@@ -74,9 +122,16 @@ def build_chat_context(db: Session, user: User, latest_message: str, structured_
         except Exception:
             symptom_str = "(unavailable)"
 
+    lab_available = "yes" if lab_str != "None provided" else "no"
+    key_tests_block = "\n".join(f"- {line}" for line in key_tests) if key_tests else "None"
     context = (
         "--- User Profile ---\n"
         f"{profile_str}\n\n"
+        f"--- Lab Report Availability ---\n"
+        f"Available: {lab_available}\n"
+        f"Source: {lab_source}\n\n"
+        "--- Key Tests (use these for follow-up answers) ---\n"
+        f"{key_tests_block}\n\n"
         "--- Latest Lab Report (structured JSON) ---\n"
         f"{lab_str}\n\n"
         "--- Latest Symptom Summary ---\n"

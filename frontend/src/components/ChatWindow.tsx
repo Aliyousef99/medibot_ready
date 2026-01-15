@@ -19,7 +19,9 @@ type ChatWindowProps = {
   onHideProfileBanner: () => void;
   uploadInputRef: React.RefObject<HTMLInputElement>;
   onUploadClick: () => void;
-  onFilePicked: (file: File) => void;
+  onFilePicked: (files: FileList) => void;
+  attachments?: { id: string; name: string; kind: "image" | "pdf"; previewUrl?: string }[];
+  onRemoveAttachment?: (id: string) => void;
   uploadStatus: "idle" | "loading" | "success" | "error";
   uploadError?: string | null;
   onClearUploadError?: () => void;
@@ -50,6 +52,8 @@ export default function ChatWindow({
   uploadInputRef,
   onUploadClick,
   onFilePicked,
+  attachments,
+  onRemoveAttachment,
   uploadStatus,
   uploadError,
   onClearUploadError,
@@ -282,6 +286,8 @@ export default function ChatWindow({
         onSend={onSend}
         uploadInputRef={uploadInputRef}
         onFilePicked={onFilePicked}
+        attachments={attachments}
+        onRemoveAttachment={onRemoveAttachment}
         busy={busy}
         fileBusy={fileBusy}
       />

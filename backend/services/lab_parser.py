@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from backend.services.ner import detect_medical_entities
+from backend.services.reference_ranges import apply_universal_reference_ranges
 
 # Patterns for common lab tests when table parsing misses them.
 TEST_PATTERNS = [
@@ -223,6 +224,36 @@ def compare_to_range(value: float, reference: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _format_value(val: float) -> str:
+    if abs(val - round(val)) < 1e-6:
+        return str(int(round(val)))
+    return f"{val:.2f}".rstrip("0").rstrip(".")
+
+
+def _maybe_rescale_value(value_str: str, value_num: float, reference: Dict[str, Any]) -> tuple[float, str]:
+    if not reference or "." in value_str:
+        return value_num, value_str
+    kind = reference.get("kind")
+    ref_min = reference.get("lo") if kind == "between" else None
+    ref_max = reference.get("hi") if kind == "between" else None
+    if kind in ("lt", "lte"):
+        ref_max = reference.get("v")
+    if kind in ("gt", "gte"):
+        ref_min = reference.get("v")
+    if not ref_max or ref_max <= 0:
+        return value_num, value_str
+    ratio = value_num / float(ref_max)
+    if ratio < 3:
+        return value_num, value_str
+    for factor in (10, 100):
+        cand = value_num / factor
+        low = float(ref_min) * 0.5 if ref_min is not None else 0.0
+        high = float(ref_max) * 1.5
+        if low <= cand <= high:
+            return cand, _format_value(cand)
+    return value_num, value_str
+
+
 def _heuristic_confidence(tests: List[Dict[str, Any]]) -> float:
     if not tests:
         return 0.0
@@ -335,6 +366,7 @@ def parse_lab_heuristics(text: str) -> Dict[str, Any]:
         if reference:
             if reference.get("unit"):
                 unit = normalize_unit_text(reference["unit"]) or unit
+            value_num, value_str = _maybe_rescale_value(value_str, value_num, reference)
             inferred = compare_to_range(value_num, reference)
             if inferred:
                 status = inferred
@@ -398,6 +430,7 @@ def parse_lab_report(text: str) -> Dict[str, Any]:
     needs_ner = (not _has_key_fields(tests)) or confidence < 0.5
 
     if not needs_ner:
+        apply_universal_reference_ranges(tests)
         return heuristics
 
     ner_out = detect_medical_entities(text)
@@ -412,6 +445,8 @@ def parse_lab_report(text: str) -> Dict[str, Any]:
             continue
         seen.add(key)
         merged.append(candidate)
+
+    apply_universal_reference_ranges(merged)
 
     combined_conf = _heuristic_confidence(merged)
     meta = dict(heuristics.get("meta") or {})

@@ -17,6 +17,10 @@ type AnalysisPanelProps = {
   recommendations?: RecommendationSet | null;
   analysisState?: "idle" | "loading" | "error";
   analysisError?: string | null;
+  systemPrompt?: string;
+  systemPromptDraft?: string;
+  onSystemPromptChange?: (value: string) => void;
+  onSaveSystemPrompt?: () => void;
 };
 
 export default function AnalysisPanel({
@@ -33,6 +37,10 @@ export default function AnalysisPanel({
   recommendations,
   analysisState = "idle",
   analysisError,
+  systemPrompt,
+  systemPromptDraft,
+  onSystemPromptChange,
+  onSaveSystemPrompt,
 }: AnalysisPanelProps) {
   return (
     <section
@@ -173,6 +181,25 @@ export default function AnalysisPanel({
           <pre className="text-xs whitespace-pre-wrap break-words rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900">
             {user?.profile ? JSON.stringify(user.profile, null, 2) : "N/A"}
           </pre>
+          <div className="text-xs uppercase tracking-wide text-zinc-400">Conversation System Prompt</div>
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900 space-y-2">
+            <textarea
+              className="w-full min-h-[120px] text-xs bg-transparent outline-none resize-y"
+              placeholder="Add per-conversation system instructions here..."
+              value={systemPromptDraft ?? systemPrompt ?? ""}
+              onChange={(e) => onSystemPromptChange?.(e.target.value)}
+            />
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                className="text-[11px] px-2 py-1 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                onClick={onSaveSystemPrompt}
+                disabled={!onSaveSystemPrompt}
+              >
+                Save prompt
+              </button>
+            </div>
+          </div>
           <div className="text-sm rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 bg-zinc-50 dark:bg-zinc-900 min-h-[120px]">
             {sanitizedExplanation || "No explanation generated yet."}
           </div>

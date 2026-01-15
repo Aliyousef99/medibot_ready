@@ -53,6 +53,12 @@ export interface ConversationMessageRow {
   created_at: string;
 }
 
+export interface ConversationContext {
+  conversation_id: string;
+  system_prompt?: string | null;
+  lab_tests?: any[] | null;
+}
+
 export interface SymptomAnalysisResult {
   summary: string;
   symptoms: { text: string; label: string; score: number; negated: boolean }[];
@@ -338,4 +344,14 @@ export const deleteConversationApi = async (conversationId: string): Promise<voi
 export const getConversationMessages = async (conversationId: string, limit = 50): Promise<ConversationMessageRow[]> => {
   const res = await api.get(`/api/chat/conversations/${conversationId}/messages`, { params: { limit } });
   return res.data as ConversationMessageRow[];
+};
+
+export const getConversationContext = async (conversationId: string): Promise<ConversationContext> => {
+  const res = await api.get(`/api/chat/conversations/${conversationId}/context`);
+  return res.data as ConversationContext;
+};
+
+export const updateConversationContext = async (conversationId: string, systemPrompt: string): Promise<ConversationContext> => {
+  const res = await api.put(`/api/chat/conversations/${conversationId}/context`, { system_prompt: systemPrompt });
+  return res.data as ConversationContext;
 };
