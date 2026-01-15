@@ -547,7 +547,6 @@ function ChatView() {
             onUpdate={(p) => {
               const updatedUser = { ...user, profile: p };
               setUser(updatedUser);
-              rerunLastMessage("profile_update");
               actions.setHideProfileBanner(true);
             }}
           />
