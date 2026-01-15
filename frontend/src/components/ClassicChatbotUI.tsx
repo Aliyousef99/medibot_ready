@@ -304,25 +304,28 @@ function ChatView() {
 
     try {
       const chatResponse: ChatResponseCombined = await requestFn(conversationId);
-      const targetConversationId = chatResponse.conversation_id || conversationId || activeId || "";
+      const { conversations: liveConversations, activeId: liveActiveId } = useChatStore.getState();
+      const targetConversationId = chatResponse.conversation_id || conversationId || liveActiveId || "";
       const replaced =
-        Boolean(targetConversationId) && Boolean(activeId) && targetConversationId !== activeId;
-      let nextConversations = conversations;
-      if (targetConversationId && targetConversationId !== activeId) {
-        if (activeId) {
-          actions.replaceConversationId(activeId, targetConversationId);
+        Boolean(targetConversationId) && Boolean(liveActiveId) && targetConversationId !== liveActiveId;
+      let nextConversations = liveConversations;
+      if (targetConversationId && targetConversationId !== liveActiveId) {
+        if (liveActiveId) {
+          actions.replaceConversationId(liveActiveId, targetConversationId);
         } else {
           actions.setActiveId(targetConversationId);
         }
       }
-      if (!replaced && targetConversationId && !conversations.some((c) => c.id === targetConversationId)) {
-        nextConversations = [{ id: targetConversationId, title: "Chat", messages: [] }, ...conversations];
+      nextConversations = useChatStore.getState().conversations;
+      if (!replaced && targetConversationId && !nextConversations.some((c) => c.id === targetConversationId)) {
+        nextConversations = [{ id: targetConversationId, title: "Chat", messages: [] }, ...nextConversations];
         actions.setConversations(nextConversations);
       }
       if (chatResponse.conversation_title && targetConversationId) {
         const nextTitle = chatResponse.conversation_title;
+        const latestConversations = useChatStore.getState().conversations;
         actions.setConversations(
-          nextConversations.map((c) => (c.id === targetConversationId ? { ...c, title: nextTitle } : c))
+          latestConversations.map((c) => (c.id === targetConversationId ? { ...c, title: nextTitle } : c))
         );
       }
       if (chatResponse.timed_out) {
